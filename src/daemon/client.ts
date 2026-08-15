@@ -87,9 +87,8 @@ export class DaemonClient {
       return port;
     }
 
-    const serverScript = join(import.meta.dir, "server.ts");
-    const bunExec = process.execPath || "bun";
-    const child = spawn(bunExec, ["run", serverScript, "--serial", this.serial], {
+    const spawnArgs = this.buildDaemonSpawnArgs();
+    const child = spawn(spawnArgs[0], spawnArgs.slice(1), {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
@@ -111,6 +110,17 @@ export class DaemonClient {
     }
 
     throw new Error(`Failed to start u2bun daemon for device '${this.serial}'`);
+  }
+
+  private buildDaemonSpawnArgs(): string[] {
+    // When running from source, server.ts exists on disk: spawn through `bun run`.
+    const serverScript = join(import.meta.dir, "server.ts");
+    if (existsSync(serverScript)) {
+      return [process.execPath || "bun", "run", serverScript, "--serial", this.serial];
+    }
+    // Compiled binary: re-invoke ourselves in --daemon-server mode (server.ts is embedded).
+    const selfExec = process.execPath || process.argv[0];
+    return [selfExec, "--daemon-server", "--serial", this.serial];
   }
 
   public async stopDaemon(): Promise<boolean> {

@@ -64,6 +64,20 @@ inside u2bun
 
 `u2bun` is a zero-dependency, ultra-fast TypeScript/Bun rewrite of `u2ctl`. Output to `stdout` is **JSON by default when `--json` is set**. Diagnostics and audit logs go to `stderr`.
 
+### 0.4 Compiling to a standalone binary
+
+u2bun can be compiled to a single native executable with `bun run build` (outputs `./u2bun` / `u2bun.exe`). The compiled binary is fully autonomous:
+
+- **`--daemon-server` hidden flag**: re-invokes the embedded daemon without needing `server.ts` on disk. Never call it directly; it is the daemon worker entry.
+- The daemon auto-start (`DaemonClient.ensureDaemon`) detects it is running as a binary (no `server.ts` next to the executable) and re-spawns itself with `--daemon-server --serial <SERIAL>`, so `ui.*` commands get the sub-15ms daemon path on any machine.
+- When running from source, the daemon still launches via `bun run src/daemon/server.ts --serial <SERIAL>` as before.
+
+Manual daemon control against a binary build (`daemon.status` / `daemon.stop` / `daemon.restart` work unchanged):
+```
+./u2bun --daemon-server --serial <SERIAL>      # start embedded daemon in foreground (for debugging)
+./u2bun --daemon-server --serial <SERIAL> --stop  # stop it
+```
+
 ---
 
 ## 1. Command Reference (full catalog)
@@ -124,12 +138,31 @@ Run everything as `bun run src/index.ts [--serial <SERIAL>] <domain> <command> [
 
 - The underlying `setClipboard` + `pasteClipboard` RPC path **corrupts non-ASCII chars** (`í` → `��`), so never force plain-ASCII clipboard for accented text.
 - The IME is `com.github.uiautomator/.AdbKeyboard` and must be the active input method. It responds to **`ADB_KEYBOARD_INPUT_TEXT`** (extra `text`, base64-encoded) — NOT `ADB_INPUT_TEXT`/`ADB_INPUT_B64` (the old senzhk ADBKeyBoard actions, which are enqueued but never dispatched).
+- **ALWAYS verify the active IME before typing non-ASCII text.** Check with:
+  ```
+  adb -s <SERIAL> shell settings get secure default_input_method
+  ```
+  If it is NOT `com.github.uiautomator/.AdbKeyboard`, ACTIVATE it (do NOT fall back to another keyboard — Gboard/LatinIME and others corrupt or drop non-ASCII chars):
+  ```
+  adb -s <SERIAL> shell ime enable com.github.uiautomator/.AdbKeyboard
+  adb -s <SERIAL> shell ime set com.github.uiautomator/.AdbKeyboard
+  ```
+- An `input_method: "clipboard"` response on non-ASCII text means the AdbKeyboard IME was not active (or the broadcast didn't dispatch). It silently CORRUPTS accents — do not post text written that way. Instead: activate the AdbKeyboard IME, clear the field with `ADB_KEYBOARD_CLEAR_TEXT`, retype, and re-verify.
+- To clear a text field when `--clear-first` fails on a corrupted value, use the manual broadcast (field MUST be focused):
+  ```
+  adb -s <SERIAL> shell am broadcast -a ADB_KEYBOARD_CLEAR_TEXT
+  ```
+- **Critical pitfall**: `ui input --clear-first` does NOT always clear a field pre-filled with corrupted text (it appends instead). When in doubt, verify the field content via `ui snapshot`/`ui dump --raw` before posting, then `ADB_KEYBOARD_CLEAR_TEXT` + retype.
 - Manual fallback (field MUST be focused first, else `ADB_KEYBOARD_CLEAR_TEXT` fails with "null object reference"):
   ```
   adb -s <SERIAL> shell am broadcast -a ADB_KEYBOARD_INPUT_TEXT --es text <base64-of-utf8-text>
   adb -s <SERIAL> shell am broadcast -a ADB_KEYBOARD_HIDE
   ```
 - Success signal: broadcast returns `result=-1`. Verify no mojibake via raw dump: assert `'\ufffd' not in raw_xml`.
+- **Restore after use**: AdbKeyboard has no visible UI. If a human operator will use the device afterward, switch back to the normal keyboard (e.g. Gboard):
+  ```
+  adb -s <SERIAL> shell ime set com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME
+  ```
 
 ---
 

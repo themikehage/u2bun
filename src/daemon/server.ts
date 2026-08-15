@@ -746,13 +746,13 @@ export class DaemonServer {
   }
 }
 
-if (import.meta.main) {
-  const serialIdx = process.argv.indexOf("--serial");
-  const serial = serialIdx !== -1 ? process.argv[serialIdx + 1] : "";
-  const stopFlag = process.argv.includes("--stop");
+export async function runDaemonServer(argv: string[] = process.argv): Promise<void> {
+  const serialIdx = argv.indexOf("--serial");
+  const serial = serialIdx !== -1 ? argv[serialIdx + 1] : "";
+  const stopFlag = argv.includes("--stop");
 
   if (!serial) {
-    console.error("Usage: bun run server.ts --serial <SERIAL> [--stop]");
+    console.error("Usage: u2bun --daemon-server --serial <SERIAL> [--stop]");
     process.exit(1);
   }
 
@@ -774,7 +774,13 @@ if (import.meta.main) {
   }
 
   const server = new DaemonServer(serial);
-  server.start().then((info) => {
-    console.log(`u2bun daemon started for device ${info.serial} on port ${info.port} (PID ${info.pid})`);
+  const info = await server.start();
+  console.log(`u2bun daemon started for device ${info.serial} on port ${info.port} (PID ${info.pid})`);
+}
+
+if (import.meta.main) {
+  runDaemonServer().catch((err) => {
+    console.error(err);
+    process.exit(1);
   });
 }

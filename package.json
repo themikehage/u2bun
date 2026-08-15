@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "bun run src/index.ts",
+    "build": "bun build --compile src/index.ts --outfile ./u2bun",
     "test": "bun test"
   },
   "dependencies": {
