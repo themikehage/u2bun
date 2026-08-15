@@ -1,0 +1,20 @@
+{
+  "name": "u2bun",
+  "version": "0.1.0",
+  "description": "Stateless, LLM-agnostic Android control CLI in Bun backed by uiautomator2 JSON-RPC",
+  "module": "src/index.ts",
+  "type": "module",
+  "bin": {
+    "u2bun": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
