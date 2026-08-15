@@ -54,6 +54,7 @@ export const APP_DOMAIN: DomainSpec = {
       outputSchema: z.object({
         package: z.string(),
         started: z.boolean(),
+        launcher: z.boolean().optional(),
       }),
       safety: "interactive",
       expect: {
@@ -67,9 +68,16 @@ export const APP_DOMAIN: DomainSpec = {
           await execAdb(["-s", target.serial, "shell", "am", "force-stop", args.package]);
         }
 
-        let cmd: string[];
+        let usedMonkey = false;
+        let startSuccess = false;
+
         if (args.activity) {
-          cmd = ["-s", target.serial, "shell", "am", "start", "-n", `${args.package}/${args.activity}`];
+          const { exitCode, stderr, stdout } = await execAdb([
+            "-s", target.serial, "shell", "am", "start", "-n", `${args.package}/${args.activity}`
+          ]);
+          if (exitCode === 0 && !stderr.includes("Error: Activity class") && !stdout.includes("Error: Activity class")) {
+            startSuccess = true;
+          }
         } else {
           // Attempt fast resolve-activity first
           let resolvedActivity: string | null = null;
@@ -78,25 +86,42 @@ export const APP_DOMAIN: DomainSpec = {
             if (res.exitCode === 0 && res.stdout.includes("/")) {
               const lines = res.stdout.trim().split("\n");
               const lastLine = lines[lines.length - 1]?.trim();
-              if (lastLine && lastLine.includes("/")) {
+              if (lastLine && lastLine.includes("/") && !lastLine.includes("No activities found")) {
                 resolvedActivity = lastLine;
               }
             }
           } catch {}
 
           if (resolvedActivity) {
-            cmd = ["-s", target.serial, "shell", "am", "start", "-n", resolvedActivity];
-          } else {
-            cmd = ["-s", target.serial, "shell", "monkey", "-p", args.package, "-c", "android.intent.category.LAUNCHER", "1"];
+            try {
+              const res = await execAdb(["-s", target.serial, "shell", "am", "start", "-n", resolvedActivity]);
+              if (res.exitCode === 0 && !res.stderr.includes("Error: Activity class") && !res.stdout.includes("Error: Activity class")) {
+                startSuccess = true;
+              }
+            } catch {}
+          }
+
+          // Fallback to monkey launcher if resolve-activity was not found or am start failed
+          if (!startSuccess) {
+            usedMonkey = true;
+            const res = await execAdb([
+              "-s", target.serial, "shell", "monkey", "-p", args.package, "-c", "android.intent.category.LAUNCHER", "1"
+            ]);
+            if (res.exitCode === 0 && !res.stdout.includes("No activities found") && !res.stderr.includes("No activities found")) {
+              startSuccess = true;
+            }
           }
         }
 
-        const { stdout, stderr, exitCode } = await execAdb(cmd);
-        if (exitCode !== 0 || stderr.includes("Error") || stdout.includes("No activities found")) {
+        if (!startSuccess) {
           throw new AppNotFoundError(args.package);
         }
 
-        return { package: args.package, started: true };
+        return {
+          package: args.package,
+          started: true,
+          ...(usedMonkey ? { launcher: true } : {}),
+        };
       },
     },
     {
@@ -142,10 +167,17 @@ export const APP_DOMAIN: DomainSpec = {
           : ["-s", target.serial, "shell", "pm", "list", "packages"];
 
         const { stdout } = await execAdb(cmd);
+        const IGNORED_PACKAGES = [
+          /^com\.github\.uiautomator(\.test)?$/,
+          /^Mono\.Android/,
+          /^com\.google\.android\.safetycore$/,
+          /^com\.amazon\.aa\.attribution$/,
+        ];
+
         const packages = stdout
           .split("\n")
           .map((l) => l.trim().replace(/^package:/, ""))
-          .filter(Boolean);
+          .filter((pkg) => Boolean(pkg) && !IGNORED_PACKAGES.some((re) => re.test(pkg)));
 
         return { packages };
       },

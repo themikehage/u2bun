@@ -8,7 +8,7 @@ import { parseSelectorArgs } from "../selectors/parser";
 import { resolveSelector } from "../selectors/resolver";
 import { SelectorNotFoundError, UsageError } from "../errors";
 
-export const BUILD_ID = "0.1.0-v4";
+export const BUILD_ID = "0.1.0-v5";
 
 export function getDaemonConfigPath(serial?: string): string {
   const safeSerial = String(serial || "default").replace(/[^a-zA-Z0-9_\-]/g, "_");
@@ -32,6 +32,7 @@ export class DaemonServer {
   private prevSnapshotLines: string[] = [];
   private server: ReturnType<typeof Bun.serve> | null = null;
   private deviceInfoCache: { width: number; height: number } | null = null;
+  private dedupCache: Map<string, ActionElement[]> = new Map();
 
   constructor(serial: string, port: number = 0) {
     this.serial = serial;
@@ -111,15 +112,33 @@ export class DaemonServer {
             const client = session.client!;
 
             let packageName: string | undefined = undefined;
+            let locked = false;
             try {
               const info = await client.deviceInfo();
               packageName = info.currentPackageName;
+              self.deviceInfoCache = {
+                width: info.displayWidth || 1080,
+                height: info.displayHeight || 2340,
+              };
+              if (packageName === "com.android.systemui") locked = true;
             } catch {}
 
             const xml = await client.dumpHierarchy(true);
-            const rawElements = parseXmlDump(xml, includeSystemBars, false);
-            const rawCount = rawElements.length;
-            let dedupedElements = deduplicateAndFilterElements(rawElements);
+            let dedupedElements: ActionElement[];
+            let rawCount: number;
+
+            const cacheKey = xml;
+            if (self.dedupCache.has(cacheKey)) {
+              dedupedElements = self.dedupCache.get(cacheKey)!;
+              rawCount = dedupedElements.length;
+            } else {
+              const rawElements = parseXmlDump(xml, includeSystemBars, false);
+              rawCount = rawElements.length;
+              dedupedElements = deduplicateAndFilterElements(rawElements);
+              if (self.dedupCache.size > 2) self.dedupCache.clear();
+              self.dedupCache.set(cacheKey, dedupedElements);
+            }
+
             const totalCount = dedupedElements.length;
 
             if (body.limit && body.limit > 0 && dedupedElements.length > body.limit) {
@@ -145,7 +164,8 @@ export class DaemonServer {
               packageName,
               body.fingerprint ? self.fingerprint : undefined,
               changed,
-              totalCount
+              totalCount,
+              locked
             );
 
             if (body.diff && hasPrev && self.prevSnapshotLines.length > 0) {
@@ -170,7 +190,100 @@ export class DaemonServer {
               element_count: self.elements.length,
               raw_count: rawCount,
               snapshot: snapshotText,
+              ...(locked ? { locked: true } : {}),
               ...(body.include_handles ? { handles: handleObj } : {}),
+            });
+          } catch (err: any) {
+            return Response.json({ ok: false, error: err.message, code: err.code || "INTERNAL" }, { status: 500 });
+          }
+        }
+
+        if (url.pathname === "/state" && (req.method === "POST" || req.method === "GET")) {
+          try {
+            const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
+            const session = await self.getSession();
+            const client = session.client!;
+
+            let packageName: string | undefined = undefined;
+            let locked = false;
+            try {
+              const info = await client.deviceInfo();
+              packageName = info.currentPackageName;
+              self.deviceInfoCache = {
+                width: info.displayWidth || 1080,
+                height: info.displayHeight || 2340,
+              };
+              if (packageName === "com.android.systemui") locked = true;
+            } catch {}
+
+            // Fast state check: if we already have a cached fingerprint and force_refresh is not requested,
+            // return package & cached fingerprint instantly without expensive dumpHierarchy RPC
+            if (!body.force_refresh && self.fingerprint) {
+              return Response.json({
+                ok: true,
+                screen_fingerprint: self.fingerprint,
+                package: packageName,
+                changed: false,
+                locked: locked ? true : undefined,
+              });
+            }
+
+            const xml = await client.dumpHierarchy(true);
+            const rawElements = parseXmlDump(xml, false, false);
+            const deduped = deduplicateAndFilterElements(rawElements);
+
+            self.handles.clear();
+            self.elements = deduped.map((el, i) => {
+              const ref = `@${i + 1}`;
+              const item = { ...el, ref, index: i };
+              self.handles.set(ref, item);
+              return item;
+            });
+
+            const newFingerprint = computeScreenFingerprint(self.elements);
+            const hasPrev = self.fingerprint !== "";
+            const changed = hasPrev ? self.fingerprint !== newFingerprint : undefined;
+            self.fingerprint = newFingerprint;
+
+            return Response.json({
+              ok: true,
+              screen_fingerprint: self.fingerprint,
+              package: packageName,
+              changed,
+              locked: locked ? true : undefined,
+            });
+          } catch (err: any) {
+            return Response.json({ ok: false, error: err.message, code: err.code || "INTERNAL" }, { status: 500 });
+          }
+        }
+
+        if (url.pathname === "/dump" && req.method === "POST") {
+          try {
+            const body = await req.json().catch(() => ({}));
+            const includeSystemBars = Boolean(body.include_system_bars);
+            const filterAll = body.filter === "all";
+            const session = await self.getSession();
+            const client = session.client!;
+
+            const xml = await client.dumpHierarchy(true);
+            const rawElements = parseXmlDump(xml, includeSystemBars, false);
+            const rawCount = rawElements.length;
+            let elements = filterAll ? rawElements : deduplicateAndFilterElements(rawElements);
+
+            if (body.limit && body.limit > 0 && elements.length > body.limit) {
+              const { width, height } = await self.getScreenDimensions(client);
+              elements = sortByRelevance(elements, width, height).slice(0, body.limit);
+            }
+
+            const fingerprint = computeScreenFingerprint(elements);
+
+            return Response.json({
+              ok: true,
+              screen_fingerprint: fingerprint,
+              element_count: elements.length,
+              raw_count: rawCount,
+              elements,
+              ...(body.raw ? { raw_xml: xml } : {}),
             });
           } catch (err: any) {
             return Response.json({ ok: false, error: err.message, code: err.code || "INTERNAL" }, { status: 500 });
@@ -184,9 +297,25 @@ export class DaemonServer {
             const session = await self.getSession();
             const client = session.client!;
 
+            const ensureCanonicalElements = async () => {
+              if (self.elements.length === 0) {
+                const xml = await client.dumpHierarchy(true);
+                const raw = parseXmlDump(xml, false, false);
+                const deduped = deduplicateAndFilterElements(raw);
+                self.handles.clear();
+                self.elements = deduped.map((el, i) => {
+                  const ref = `@${i + 1}`;
+                  const item = { ...el, ref, index: i };
+                  self.handles.set(ref, item);
+                  return item;
+                });
+              }
+            };
+
             if (command === "tap") {
               let targetX: number;
               let targetY: number;
+              const refKey = args.ref !== undefined && args.ref !== null ? (String(args.ref).startsWith("@") ? String(args.ref) : `@${args.ref}`) : undefined;
 
               if (args.pos) {
                 const parts = String(args.pos).replace(/\s+/g, "").split(",").map(Number);
@@ -195,16 +324,13 @@ export class DaemonServer {
                 }
                 targetX = parts[0];
                 targetY = parts[1];
-              } else if (args.ref && self.handles.has(args.ref)) {
-                const el = self.handles.get(args.ref)!;
-                const matched = resolveSelector([el], { ref: args.ref });
+              } else if (refKey && self.handles.has(refKey)) {
+                const el = self.handles.get(refKey)!;
+                const matched = resolveSelector([el], { ref: refKey });
                 targetX = matched.centerX;
                 targetY = matched.centerY;
               } else {
-                if (self.elements.length === 0) {
-                  const xml = await client.dumpHierarchy(true);
-                  self.elements = parseXmlDump(xml, true);
-                }
+                await ensureCanonicalElements();
                 const query = parseSelectorArgs(args);
                 const matched = resolveSelector(self.elements, query);
                 targetX = matched.centerX;
@@ -243,14 +369,12 @@ export class DaemonServer {
 
             if (command === "long_press") {
               let matched: ReturnType<typeof resolveSelector>;
-              if (args.ref && self.handles.has(args.ref)) {
-                const el = self.handles.get(args.ref)!;
-                matched = resolveSelector([el], { ref: args.ref });
+              const refKey = args.ref !== undefined && args.ref !== null ? (String(args.ref).startsWith("@") ? String(args.ref) : `@${args.ref}`) : undefined;
+              if (refKey && self.handles.has(refKey)) {
+                const el = self.handles.get(refKey)!;
+                matched = resolveSelector([el], { ref: refKey });
               } else {
-                if (self.elements.length === 0) {
-                  const xml = await client.dumpHierarchy(true);
-                  self.elements = parseXmlDump(xml, true);
-                }
+                await ensureCanonicalElements();
                 const query = parseSelectorArgs(args);
                 matched = resolveSelector(self.elements, query);
               }
@@ -307,8 +431,8 @@ export class DaemonServer {
             if (command === "swipe") {
               let fx = 0, fy = 0, tx = 0, ty = 0;
               if (args.from_pos && args.to_pos) {
-                const fParts = args.from_pos.replace(/\s+/g, "").split(",").map(Number);
-                const tParts = args.to_pos.replace(/\s+/g, "").split(",").map(Number);
+                const fParts = String(args.from_pos).replace(/\s+/g, "").split(",").map(Number);
+                const tParts = String(args.to_pos).replace(/\s+/g, "").split(",").map(Number);
                 fx = fParts[0]; fy = fParts[1];
                 tx = tParts[0]; ty = tParts[1];
               } else if (
@@ -317,10 +441,10 @@ export class DaemonServer {
                 args.to_x !== undefined &&
                 args.to_y !== undefined
               ) {
-                fx = args.from_x; fy = args.from_y;
-                tx = args.to_x; ty = args.to_y;
+                fx = Number(args.from_x); fy = Number(args.from_y);
+                tx = Number(args.to_x); ty = Number(args.to_y);
               } else {
-                throw new UsageError("Must specify either '--from-pos X,Y --to-pos X,Y' or '--from-x ... --from-y ... --to-x ... --to-y ...'");
+                throw new UsageError("Must specify coordinates for swipe");
               }
 
               const steps = args.duration_steps ?? Math.round((args.duration ?? 0.2) * 100);
@@ -371,53 +495,77 @@ export class DaemonServer {
             }
 
             if (command === "type") {
-              const hasSelector = Boolean(args.ref || args.text_contains || args.resource_id || args.description || args.desc_contains || args.bounds);
+              const textToType = String(args.value ?? args.text ?? "");
+              const selectorArgs = { ...args };
+              delete selectorArgs.value;
+              if (args.value === undefined) {
+                delete selectorArgs.text;
+              }
+
+              const refKey = args.ref !== undefined && args.ref !== null ? (String(args.ref).startsWith("@") ? String(args.ref) : `@${args.ref}`) : undefined;
+              const hasSelector = Boolean(
+                refKey ||
+                selectorArgs.text ||
+                selectorArgs.text_contains ||
+                selectorArgs.resource_id ||
+                selectorArgs.description ||
+                selectorArgs.desc_contains ||
+                selectorArgs.bounds
+              );
+
               if (hasSelector) {
                 let matched: ReturnType<typeof resolveSelector>;
-                if (args.ref && self.handles.has(args.ref)) {
-                  const el = self.handles.get(args.ref)!;
-                  matched = resolveSelector([el], { ref: args.ref });
+                if (refKey && self.handles.has(refKey)) {
+                  const el = self.handles.get(refKey)!;
+                  matched = resolveSelector([el], { ref: refKey });
                 } else {
-                  if (self.elements.length === 0) {
-                    const xml = await client.dumpHierarchy(true);
-                    self.elements = parseXmlDump(xml, true);
-                  }
-                  const query = parseSelectorArgs(args);
+                  await ensureCanonicalElements();
+                  const query = parseSelectorArgs(selectorArgs);
                   matched = resolveSelector(self.elements, query);
                 }
                 await client.click(matched.centerX, matched.centerY);
               }
 
-              await session.setInputText(args.text);
+              await session.setInputText(textToType);
 
-              const postXml = await client.dumpHierarchy(true);
-              const postElements = parseXmlDump(postXml);
-              const fingerprint = computeScreenFingerprint(postElements);
-              self.fingerprint = fingerprint;
+              const hasExpect = Boolean(args.expect_desc_contains || args.expect_text_contains || args.expect_element_absent);
+              const postcondition: Record<string, unknown> = { satisfied: true };
+
+              if (hasExpect) {
+                const postXml = await client.dumpHierarchy(true);
+                const postElements = parseXmlDump(postXml, true);
+                const fingerprint = computeScreenFingerprint(postElements);
+                self.fingerprint = fingerprint;
+                const [satisfied, matchedElem] = checkExpect(args, postElements);
+                postcondition.expect_satisfied = satisfied;
+                if (matchedElem) postcondition.matched_element = matchedElem;
+                return Response.json({
+                  ok: true,
+                  result: {
+                    text_typed: textToType,
+                    screen_fingerprint: fingerprint,
+                    postcondition,
+                  },
+                });
+              }
 
               return Response.json({
                 ok: true,
                 result: {
-                  text_typed: args.text,
-                  screen_fingerprint: fingerprint,
-                  postcondition: { satisfied: true },
+                  text_typed: textToType,
+                  postcondition,
                 },
               });
             }
 
             if (command === "press") {
               await client.pressKey(String(args.key).toLowerCase());
-              const postXml = await client.dumpHierarchy(true);
-              const postElements = parseXmlDump(postXml);
-              const fingerprint = computeScreenFingerprint(postElements);
-              self.fingerprint = fingerprint;
 
               return Response.json({
                 ok: true,
                 result: {
                   key: args.key,
                   pressed: true,
-                  screen_fingerprint: fingerprint,
                 },
               });
             }

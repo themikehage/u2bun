@@ -37,8 +37,18 @@ export function computeScreenFingerprint(elements: ActionElement[]): string {
     (e) => `${e.resourceId}:${e.text}:${e.contentDesc}:${e.className}:${e.bounds}`
   );
   tuples.sort();
-  const raw = tuples.join("|");
-  return createHash("sha256").update(raw, "utf-8").digest("hex").slice(0, 16);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5;
+  for (const t of tuples) {
+    for (let i = 0; i < t.length; i++) {
+      const code = t.charCodeAt(i);
+      h1 = Math.imul(h1 ^ code, 0x01000193);
+      h2 = Math.imul(h2 ^ (code >> 4), 0x01000193);
+    }
+  }
+  const part1 = (h1 >>> 0).toString(16).padStart(8, "0");
+  const part2 = (h2 >>> 0).toString(16).padStart(8, "0");
+  return `${part1}${part2}`;
 }
 
 const STRUCTURAL_CLASSES = new Set([
@@ -136,11 +146,6 @@ export function deduplicateAndFilterElements(elements: ActionElement[]): ActionE
       const maxArea = Math.max(area1, area2);
       const sizeRatio = maxArea / Math.max(minArea, 1);
 
-      // Do not merge elements of vastly different sizes (e.g. child inside container/card)
-      if (sizeRatio > 2.5) {
-        continue;
-      }
-
       const existing = result[i];
       const existingText = (existing.text || existing.contentDesc || "").trim();
       const currentText = (current.text || current.contentDesc || "").trim();
@@ -150,12 +155,27 @@ export function deduplicateAndFilterElements(elements: ActionElement[]): ActionE
         continue;
       }
 
+      // Check if both elements have the exact same non-empty label (e.g. parent Button + child Item)
+      const sameLabel = Boolean(existingText && currentText && existingText === currentText);
+
+      // Do not merge elements of vastly different sizes UNLESS they share the exact same non-empty label (ancestor-descendant duplicate)
+      if (sizeRatio > 2.5 && !sameLabel) {
+        continue;
+      }
+
       const overlap = rectOverlapRatio(currentRect, existingRect);
-      if (overlap >= OVERLAP_MERGE) {
+      const isContained = (inner: { x1: number; y1: number; x2: number; y2: number }, outer: { x1: number; y1: number; x2: number; y2: number }) =>
+        inner.x1 >= outer.x1 - 10 && inner.y1 >= outer.y1 - 10 && inner.x2 <= outer.x2 + 10 && inner.y2 <= outer.y2 + 10;
+
+      const shouldMerge = overlap >= OVERLAP_MERGE || (sameLabel && (overlap >= 0.3 || isContained(currentRect, existingRect) || isContained(existingRect, currentRect)));
+
+      if (shouldMerge) {
         const existingHasText = Boolean(existingText);
         const currentHasText = Boolean(currentText);
+        const existingHasAction = existing.clickable || existing.className?.endsWith("Button") || existing.className?.endsWith("EditText");
+        const currentHasAction = current.clickable || current.className?.endsWith("Button") || current.className?.endsWith("EditText");
 
-        if (!existingHasText && currentHasText) {
+        if ((!existingHasText && currentHasText) || (!existingHasAction && currentHasAction)) {
           result[i] = {
             ...current,
             index: existing.index,
@@ -245,10 +265,13 @@ export function formatCompactSnapshot(
   packageName?: string,
   fingerprint?: string,
   changed?: boolean,
-  totalCount?: number
+  totalCount?: number,
+  locked?: boolean
 ): string {
   let header = `[App: ${packageName || "active"}`;
-  if (changed !== undefined) {
+  if (locked) {
+    header += ` | locked: true | hint: run device unlock`;
+  } else if (changed !== undefined) {
     header += ` | changed: ${changed ? "yes" : "no"}`;
   } else if (fingerprint) {
     header += ` | fingerprint: ${fingerprint}`;
@@ -260,10 +283,12 @@ export function formatCompactSnapshot(
     const role = getSemanticRole(e);
     const label = e.text || e.contentDesc || "";
     const labelStr = label ? ` "${label}"` : "";
+    const rect = parseBoundsRect(e.bounds);
+    const centerStr = (!label && rect) ? ` @x=${Math.round((rect.x1 + rect.x2) / 2)},y=${Math.round((rect.y1 + rect.y2) / 2)}` : "";
     const stateFlags: string[] = [];
     if (e.focused) stateFlags.push("focused");
     const stateStr = stateFlags.length > 0 ? ` [${stateFlags.join(", ")}]` : "";
-    return `[${ref}] ${role}${labelStr}${stateStr}`;
+    return `[${ref}] ${role}${labelStr}${centerStr}${stateStr}`;
   });
 
   if (totalCount !== undefined && totalCount > elements.length) {
@@ -302,31 +327,48 @@ export function parseXmlDump(
   if (!xmlContent) return elements;
 
   const nodeRegex = /<node\s+([^>]+)\/?>/g;
+  const attrRegex = /([a-zA-Z0-9_\-]+)="([^"]*)"/g;
   let match: RegExpExecArray | null;
 
   let indexCounter = 0;
 
   while ((match = nodeRegex.exec(xmlContent)) !== null) {
     const attrStr = match[1];
-    const getAttr = (key: string) => {
-      const m = attrStr.match(getAttrRegex(key));
-      return m ? decodeXmlEntities(m[1]) : "";
-    };
+    let attrMatch: RegExpExecArray | null;
+    attrRegex.lastIndex = 0;
 
-    const resId = getAttr("resource-id");
-    const pkgName = getAttr("package");
-    const text = getAttr("text");
-    const desc = getAttr("content-desc");
-    const clsName = getAttr("class");
-    const bounds = getAttr("bounds");
+    let resId = "";
+    let pkgName = "";
+    let text = "";
+    let desc = "";
+    let clsName = "";
+    let bounds = "";
+    let clickable = false;
+    let scrollable = false;
+    let checkable = false;
+    let focused = false;
+    let focusable = false;
+
+    while ((attrMatch = attrRegex.exec(attrStr)) !== null) {
+      const key = attrMatch[1];
+      const val = attrMatch[2];
+      switch (key) {
+        case "resource-id": resId = decodeXmlEntities(val); break;
+        case "package": pkgName = decodeXmlEntities(val); break;
+        case "text": text = decodeXmlEntities(val); break;
+        case "content-desc": desc = decodeXmlEntities(val); break;
+        case "class": clsName = decodeXmlEntities(val); break;
+        case "bounds": bounds = val; break;
+        case "clickable": clickable = val === "true"; break;
+        case "scrollable": scrollable = val === "true"; break;
+        case "checkable": checkable = val === "true"; break;
+        case "focused": focused = val === "true"; break;
+        case "focusable": focusable = val === "true"; break;
+      }
+    }
 
     if (!bounds) continue;
 
-    const clickable = getAttr("clickable") === "true";
-    const scrollable = getAttr("scrollable") === "true";
-    const checkable = getAttr("checkable") === "true";
-    const focused = getAttr("focused") === "true";
-    const focusable = getAttr("focusable") === "true";
     const editable = focusable && clsName.endsWith("EditText");
 
     if (!includeSystemBars) {
@@ -418,6 +460,12 @@ export function checkExpect(
   }
 }
 
+export const handleRefSchema = z
+  .union([z.string(), z.number()])
+  .transform((v) => (typeof v === "number" || !String(v).startsWith("@") ? `@${v}` : String(v)))
+  .optional()
+  .describe("Element handle from ui.snapshot (e.g. @1, @2)");
+
 export const UI_DOMAIN: DomainSpec = {
   name: "ui",
   description: "UI hierarchy projection, semantic selector interaction, gestures, and text input",
@@ -439,6 +487,7 @@ export const UI_DOMAIN: DomainSpec = {
         element_count: z.number(),
         raw_count: z.number().optional(),
         snapshot: z.string(),
+        locked: z.boolean().optional(),
         handles: z.record(z.unknown()).optional(),
       }),
       safety: "read",
@@ -453,11 +502,10 @@ export const UI_DOMAIN: DomainSpec = {
               element_count: daemonRes.element_count,
               raw_count: daemonRes.raw_count,
               snapshot: daemonRes.snapshot,
+              ...(daemonRes.locked ? { locked: true } : {}),
               ...(daemonRes.handles ? { handles: daemonRes.handles } : {}),
             };
-          } catch (e: any) {
-            ctx.warn(`Daemon snapshot failed, falling back to direct RPC: ${e.message}`);
-          }
+          } catch {}
         }
 
         const session = new DeviceSession(ctx.serial, ctx.timeout);
@@ -465,9 +513,11 @@ export const UI_DOMAIN: DomainSpec = {
         ctx.serial = session.serial;
 
         let packageName: string | undefined = undefined;
+        let locked = false;
         try {
           const info = await client.deviceInfo();
           packageName = info.currentPackageName;
+          if (packageName === "com.android.systemui") locked = true;
         } catch {}
 
         const xml = await client.dumpHierarchy(true);
@@ -485,7 +535,8 @@ export const UI_DOMAIN: DomainSpec = {
           packageName,
           args.fingerprint ? fp : undefined,
           undefined,
-          totalCount
+          totalCount,
+          locked
         );
 
         const handlesObj: Record<string, unknown> = {};
@@ -502,7 +553,61 @@ export const UI_DOMAIN: DomainSpec = {
           element_count: elements.length,
           raw_count: rawCount,
           snapshot: snapshotText,
+          ...(locked ? { locked: true } : {}),
           ...(args.include_handles ? { handles: handlesObj } : {}),
+        };
+      },
+    },
+    {
+      name: "ui.state",
+      domain: "ui",
+      description: "Fast screen state hash and package check without rendering full snapshot tree",
+      inputSchema: z.object({
+        include_system_bars: z.boolean().optional().default(false),
+        use_daemon: z.boolean().optional().default(true),
+      }),
+      outputSchema: z.object({
+        screen_fingerprint: z.string(),
+        package: z.string().optional(),
+        changed: z.boolean().optional(),
+        locked: z.boolean().optional(),
+      }),
+      safety: "read",
+      handler: async (ctx, args) => {
+        if (args.use_daemon) {
+          try {
+            const daemonClient = new DaemonClient(ctx.serial);
+            const daemonRes = await daemonClient.state(args);
+            ctx.serial = daemonClient.serial || ctx.serial;
+            return {
+              screen_fingerprint: daemonRes.screen_fingerprint,
+              package: daemonRes.package,
+              changed: daemonRes.changed,
+              locked: daemonRes.locked,
+            };
+          } catch {}
+        }
+
+        const session = new DeviceSession(ctx.serial, ctx.timeout);
+        const client = await session.connect();
+        ctx.serial = session.serial;
+
+        let packageName: string | undefined = undefined;
+        let locked = false;
+        try {
+          const info = await client.deviceInfo();
+          packageName = info.currentPackageName;
+          if (packageName === "com.android.systemui") locked = true;
+        } catch {}
+
+        const xml = await client.dumpHierarchy(true);
+        const elements = parseXmlDump(xml, args.include_system_bars, true);
+        const fp = computeScreenFingerprint(elements);
+
+        return {
+          screen_fingerprint: fp,
+          package: packageName,
+          locked: locked ? true : undefined,
         };
       },
     },
@@ -515,6 +620,7 @@ export const UI_DOMAIN: DomainSpec = {
         limit: z.number().optional().default(30),
         include_system_bars: z.boolean().optional().default(false),
         raw: z.boolean().optional().default(false),
+        use_daemon: z.boolean().optional().default(true),
       }),
       outputSchema: z.object({
         screen_fingerprint: z.string(),
@@ -525,6 +631,23 @@ export const UI_DOMAIN: DomainSpec = {
       }),
       safety: "read",
       handler: async (ctx, args) => {
+        if (args.use_daemon) {
+          try {
+            const daemonClient = new DaemonClient(ctx.serial);
+            const daemonRes = await daemonClient.dump(args);
+            ctx.serial = daemonClient.serial || ctx.serial;
+            if (daemonRes.ok) {
+              return {
+                screen_fingerprint: daemonRes.screen_fingerprint,
+                element_count: daemonRes.element_count,
+                raw_count: daemonRes.raw_count,
+                elements: daemonRes.elements,
+                ...(daemonRes.raw_xml ? { raw_xml: daemonRes.raw_xml } : {}),
+              };
+            }
+          } catch {}
+        }
+
         const session = new DeviceSession(ctx.serial, ctx.timeout);
         const client = await session.connect();
         ctx.serial = session.serial;
@@ -555,7 +678,7 @@ export const UI_DOMAIN: DomainSpec = {
       domain: "ui",
       description: "Tap visible UI element matching selector or bounds coordinates",
       inputSchema: z.object({
-        ref: z.string().optional().describe("Element handle from ui.snapshot (e.g. @1, @2)"),
+        ref: handleRefSchema,
         pos: z.string().optional().describe("Direct tap coordinates 'X,Y' (bypasses selector resolution)"),
         text: z.string().optional(),
         text_contains: z.string().optional(),
@@ -589,9 +712,7 @@ export const UI_DOMAIN: DomainSpec = {
             if (daemonRes.ok) {
               return daemonRes.result;
             }
-          } catch (e: any) {
-            ctx.warn(`Daemon tap action failed, falling back to direct RPC: ${e.message}`);
-          }
+          } catch {}
         }
 
         const session = new DeviceSession(ctx.serial, ctx.timeout);
@@ -659,7 +780,7 @@ export const UI_DOMAIN: DomainSpec = {
       domain: "ui",
       description: "Long-press one visible UI element matched by selector",
       inputSchema: z.object({
-        ref: z.string().optional().describe("Element handle from ui.snapshot (e.g. @1, @2)"),
+        ref: handleRefSchema,
         text: z.string().optional(),
         text_contains: z.string().optional(),
         resource_id: z.string().optional(),
@@ -689,9 +810,7 @@ export const UI_DOMAIN: DomainSpec = {
             const daemonRes = await daemonClient.action("long_press", args);
             ctx.serial = daemonClient.serial || ctx.serial;
             if (daemonRes.ok) return daemonRes.result;
-          } catch (e: any) {
-            ctx.warn(`Daemon long_press action failed, falling back to direct RPC: ${e.message}`);
-          }
+          } catch {}
         }
 
         const session = new DeviceSession(ctx.serial, ctx.timeout);
@@ -764,9 +883,7 @@ export const UI_DOMAIN: DomainSpec = {
             const daemonRes = await daemonClient.action("input", args);
             ctx.serial = daemonClient.serial || ctx.serial;
             if (daemonRes.ok) return daemonRes.result;
-          } catch (e: any) {
-            ctx.warn(`Daemon input action failed, falling back to direct RPC: ${e.message}`);
-          }
+          } catch {}
         }
         const session = new DeviceSession(ctx.serial, ctx.timeout);
         const client = await session.connect();
@@ -819,9 +936,7 @@ export const UI_DOMAIN: DomainSpec = {
             const daemonRes = await daemonClient.action("swipe", args);
             ctx.serial = daemonClient.serial || ctx.serial;
             if (daemonRes.ok) return daemonRes.result;
-          } catch (e: any) {
-            ctx.warn(`Daemon swipe action failed, falling back to direct RPC: ${e.message}`);
-          }
+          } catch {}
         }
 
         const session = new DeviceSession(ctx.serial, ctx.timeout);
@@ -883,9 +998,7 @@ export const UI_DOMAIN: DomainSpec = {
             const daemonRes = await daemonClient.action("scroll", args);
             ctx.serial = daemonClient.serial || ctx.serial;
             if (daemonRes.ok) return daemonRes.result;
-          } catch (e: any) {
-            ctx.warn(`Daemon scroll action failed, falling back to direct RPC: ${e.message}`);
-          }
+          } catch {}
         }
 
         const session = new DeviceSession(ctx.serial, ctx.timeout);
@@ -928,8 +1041,9 @@ export const UI_DOMAIN: DomainSpec = {
       domain: "ui",
       description: "Macro to focus input field (via selector) and type text in one step",
       inputSchema: z.object({
-        ref: z.string().optional().describe("Element handle from ui.snapshot (e.g. @1, @2)"),
-        text: z.string().describe("Text to type"),
+        ref: handleRefSchema,
+        text: z.string().optional().describe("Text to type"),
+        value: z.string().optional().describe("Text to type (preferred over --text)"),
         text_contains: z.string().optional(),
         resource_id: z.string().optional(),
         description: z.string().optional(),
@@ -939,8 +1053,8 @@ export const UI_DOMAIN: DomainSpec = {
       }),
       outputSchema: z.object({
         text_typed: z.string(),
-        screen_fingerprint: z.string(),
-        postcondition: z.record(z.unknown()),
+        screen_fingerprint: z.string().optional(),
+        postcondition: z.record(z.unknown()).optional(),
       }),
       safety: "interactive",
       expect: {
@@ -953,21 +1067,36 @@ export const UI_DOMAIN: DomainSpec = {
             const daemonRes = await daemonClient.action("type", args);
             ctx.serial = daemonClient.serial || ctx.serial;
             if (daemonRes.ok) return daemonRes.result;
-          } catch (e: any) {
-            ctx.warn(`Daemon type action failed, falling back to direct RPC: ${e.message}`);
-          }
+          } catch {}
         }
 
         const session = new DeviceSession(ctx.serial, ctx.timeout);
         const client = await session.connect();
         ctx.serial = session.serial;
 
-        const hasSelector = Boolean(args.ref || args.text_contains || args.resource_id || args.description || args.desc_contains || args.bounds);
+        const textToType = String(args.value ?? args.text ?? "");
+        const selectorArgs = { ...args };
+        delete selectorArgs.value;
+        if (args.value === undefined) {
+          delete selectorArgs.text;
+        }
+
+        const refKey = args.ref !== undefined && args.ref !== null ? (String(args.ref).startsWith("@") ? String(args.ref) : `@${args.ref}`) : undefined;
+        const hasSelector = Boolean(
+          refKey ||
+          selectorArgs.text ||
+          selectorArgs.text_contains ||
+          selectorArgs.resource_id ||
+          selectorArgs.description ||
+          selectorArgs.desc_contains ||
+          selectorArgs.bounds
+        );
+
         if (hasSelector) {
           const xml = await client.dumpHierarchy(true);
           const rawElements = parseXmlDump(xml, true, false);
           const elements = deduplicateAndFilterElements(rawElements);
-          const query = parseSelectorArgs(args as Record<string, unknown>);
+          const query = parseSelectorArgs(selectorArgs as Record<string, unknown>);
           const matched = resolveSelector(elements, query, false, rawElements);
 
           if (matched.warnings.length > 0) {
@@ -977,15 +1106,10 @@ export const UI_DOMAIN: DomainSpec = {
           await client.click(matched.centerX, matched.centerY);
         }
 
-        await session.setInputText(args.text);
-
-        const postXml = await client.dumpHierarchy(true);
-        const postElements = parseXmlDump(postXml);
-        const fingerprint = computeScreenFingerprint(postElements);
+        await session.setInputText(textToType);
 
         return {
-          text_typed: args.text,
-          screen_fingerprint: fingerprint,
+          text_typed: textToType,
           postcondition: { satisfied: true },
         };
       },
@@ -1014,9 +1138,7 @@ export const UI_DOMAIN: DomainSpec = {
             const daemonRes = await daemonClient.action("press", args);
             ctx.serial = daemonClient.serial || ctx.serial;
             if (daemonRes.ok) return daemonRes.result;
-          } catch (e: any) {
-            ctx.warn(`Daemon press action failed, falling back to direct RPC: ${e.message}`);
-          }
+          } catch {}
         }
 
         const session = new DeviceSession(ctx.serial, ctx.timeout);
@@ -1025,14 +1147,9 @@ export const UI_DOMAIN: DomainSpec = {
 
         await client.pressKey(args.key.toLowerCase());
 
-        const postXml = await client.dumpHierarchy(true);
-        const postElements = parseXmlDump(postXml);
-        const fingerprint = computeScreenFingerprint(postElements);
-
         return {
           key: args.key,
           pressed: true,
-          screen_fingerprint: fingerprint,
         };
       },
     },
@@ -1041,7 +1158,7 @@ export const UI_DOMAIN: DomainSpec = {
       domain: "ui",
       description: "Wait for an element matching selector to become present or absent",
       inputSchema: z.object({
-        ref: z.string().optional().describe("Element handle from ui.snapshot (e.g. @1, @2)"),
+        ref: handleRefSchema,
         text: z.string().optional(),
         text_contains: z.string().optional(),
         resource_id: z.string().optional(),
@@ -1123,7 +1240,7 @@ export const UI_DOMAIN: DomainSpec = {
       domain: "ui",
       description: "Scroll repeatedly until selector element is found or max scrolls reached",
       inputSchema: z.object({
-        ref: z.string().optional().describe("Element handle from ui.snapshot (e.g. @1, @2)"),
+        ref: handleRefSchema,
         text: z.string().optional(),
         text_contains: z.string().optional(),
         resource_id: z.string().optional(),

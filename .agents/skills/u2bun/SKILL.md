@@ -75,11 +75,12 @@ Run everything as `bun run src/index.ts [--serial <SERIAL>] <domain> <command> [
 | Command | Purpose | Key flags |
 |---|---|---|
 | `ui snapshot` | Compact semantic tree with `@1..@N` handles (LLM-first). **Prefer over `ui dump`.** | `--limit` (default 30), `--include-system-bars`, `--include-handles`, `--diff` (only changed lines), `--fingerprint` |
+| `ui state` | Ultra-fast screen state hash + package check without rendering tree. | `--include-system-bars` |
 | `ui dump` | Raw actionable element list + fingerprint. Use only when a handle is missing. | `--filter actionable\|all`, `--limit`, `--raw` (returns `raw_xml`) |
 | `ui tap` | Tap element by handle or selector. | `--ref @N`, `--text`, `--text-contains`, `--resource-id`, `--desc-contains`, `--description`, `--class-name`, `--bounds`, `--expect-desc-contains`, `--expect-text-contains`, `--expect-element-absent` |
 | `ui long_press` | Long-press element. | same selectors as `tap` + `--duration` + `--expect-*` |
 | `ui input` | Type into focused field. | `--text`, `--clear-first` |
-| `ui type` | Macro: focus field (selector) + type in one step. | `--text` + any `tap` selector |
+| `ui type` | Macro: focus field (selector) + type in one step. | `--value "X"` (or `--text "X"`) + any selector |
 | `ui swipe` | Gesture from point A to B. | `--from-pos X,Y --to-pos X,Y` (or `--from-x/--from-y/--to-x/--to-y`), `--duration` |
 | `ui scroll` | High-level scroll in a direction. | `--direction down\|up\|left\|right`, `--duration` |
 | `ui press` | Hardware/nav key. | `--key back\|home\|enter\|delete\|volume_up\|...` |
@@ -88,7 +89,7 @@ Run everything as `bun run src/index.ts [--serial <SERIAL>] <domain> <command> [
 
 ### 1.2 Selector flags (shared by tap/long_press/type/wait/find)
 
-- `--ref @N` — handle from the last `ui snapshot` (fastest, sub-15ms).
+- `--ref @N` (or `--ref N`) — handle from the last `ui snapshot` (fastest, sub-15ms).
 - `--text "X"` / `--text-contains "X"` — exact / substring match on text.
 - `--resource-id "pkg:id/x"` / `--description "X"` / `--desc-contains "X"`.
 - `--bounds "[x1,y1][x2,y2]"` — absolute coordinates fallback.

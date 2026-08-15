@@ -2,6 +2,8 @@
 
 This document defines the core invariants and rules for `u2bun`. Every contribution and refactor MUST adhere strictly to these principles.
 
+Read skill `.agents/skills/u2bun/SKILL.md` for instrutions abuot how to use u2bun.
+
 ## 1. Core Invariants
 
 1. **Zero-Dependency Core**: Built purely on Bun and TypeScript native APIs. No external browser/device SDKs or heavy runtime dependencies inside `src/`.

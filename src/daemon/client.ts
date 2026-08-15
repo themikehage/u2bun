@@ -88,7 +88,8 @@ export class DaemonClient {
     }
 
     const serverScript = join(import.meta.dir, "server.ts");
-    const child = spawn("bun", ["run", serverScript, "--serial", this.serial], {
+    const bunExec = process.execPath || "bun";
+    const child = spawn(bunExec, ["run", serverScript, "--serial", this.serial], {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
@@ -96,8 +97,12 @@ export class DaemonClient {
     });
     child.unref();
 
-    for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, 50));
+    let delay = 20;
+    let elapsed = 0;
+    while (elapsed < 3000) {
+      await new Promise((r) => setTimeout(r, delay));
+      elapsed += delay;
+      delay = Math.min(Math.round(delay * 1.5), 300);
       port = await this.getActivePort();
       if (port !== null) {
         this.port = port;
@@ -177,6 +182,50 @@ export class DaemonClient {
         if (!res.ok) {
           const err = await res.json().catch(() => ({ error: res.statusText }));
           throw new Error(`Daemon snapshot failed: ${err.error || res.statusText}`);
+        }
+        return await res.json();
+      } catch (err: any) {
+        this.port = null;
+        if (attempt === 1) throw err;
+      }
+    }
+  }
+
+  public async state(args: Record<string, unknown> = {}): Promise<any> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const port = await this.ensureDaemon();
+        const res = await fetch(`http://127.0.0.1:${port}/state`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Connection: "keep-alive" },
+          body: JSON.stringify(args),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(`Daemon state failed: ${err.error || res.statusText}`);
+        }
+        return await res.json();
+      } catch (err: any) {
+        this.port = null;
+        if (attempt === 1) throw err;
+      }
+    }
+  }
+
+  public async dump(args: Record<string, unknown> = {}): Promise<any> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const port = await this.ensureDaemon();
+        const res = await fetch(`http://127.0.0.1:${port}/dump`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Connection: "keep-alive" },
+          body: JSON.stringify(args),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(`Daemon dump failed: ${err.error || res.statusText}`);
         }
         return await res.json();
       } catch (err: any) {

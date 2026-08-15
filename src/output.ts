@@ -96,6 +96,16 @@ export function renderOutput(
       return;
     }
 
+    // 1b. ui.state: fast compact state string
+    if (envelope.command === "ui.state" || (typeof res.screen_fingerprint === "string" && !res.snapshot && !res.elements)) {
+      let stateLine = `[App: ${res.package || "active"} | fingerprint: ${res.screen_fingerprint}`;
+      if (res.locked) stateLine += ` | locked: true`;
+      if (res.changed !== undefined) stateLine += ` | changed: ${res.changed ? "yes" : "no"}`;
+      stateLine += `]`;
+      console.log(stateLine);
+      return;
+    }
+
     // 2. Query commands: app.current, app.list, device.list, device.status/auto, daemon.status
     if (typeof res.running === "boolean") {
       if (res.running) {
@@ -123,8 +133,24 @@ export function renderOutput(
       return;
     }
 
-    // 3. Action commands (tap, input, press, swipe, long_press, wait, app.start, app.stop, daemon.restart, daemon.stop, etc.): return "ok"
+    // 3. Action commands: check by command name or action flags
+    const ACTION_COMMANDS = new Set([
+      "ui.tap",
+      "ui.press",
+      "ui.input",
+      "ui.type",
+      "ui.swipe",
+      "ui.scroll",
+      "ui.long_press",
+      "app.start",
+      "app.stop",
+      "device.reconnect",
+      "daemon.stop",
+      "daemon.restart",
+    ]);
+
     if (
+      ACTION_COMMANDS.has(envelope.command) ||
       res.tapped ||
       res.success ||
       res.pressed ||

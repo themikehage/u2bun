@@ -14,8 +14,8 @@ export interface SelectorQuery {
 export function parseSelectorArgs(args: Record<string, unknown>): SelectorQuery {
   const query: SelectorQuery = {};
 
-  if (typeof args.ref === "string" && args.ref.trim()) {
-    let refVal = args.ref.trim();
+  if (args.ref !== undefined && args.ref !== null && String(args.ref).trim()) {
+    let refVal = String(args.ref).trim();
     if (!refVal.startsWith("@")) {
       refVal = "@" + refVal;
     }

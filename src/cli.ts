@@ -68,7 +68,7 @@ export function parseArgs(rawArgs: string[]): {
         toolArgs[toSnakeCase(k)] = parseTypedValue(v);
       } else {
         const next = rawArgs[i + 1];
-        if (next !== undefined && !next.startsWith("-")) {
+        if (next !== undefined && (!next.startsWith("-") || next.startsWith("@") || /^-?\d+$/.test(next))) {
           toolArgs[toSnakeCase(param)] = parseTypedValue(next);
           i++;
         } else {
