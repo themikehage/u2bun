@@ -4,9 +4,11 @@ import { U2Error, UsageError, InternalError } from "./errors";
 import { registry, type HandlerContext } from "./registry";
 import { DOMAINS } from "./domains";
 
-// Register all domains at startup
+// Register all domains at startup if not already registered
 for (const domain of DOMAINS) {
-  registry.registerDomain(domain);
+  if (!registry.hasDomain(domain.name)) {
+    registry.registerDomain(domain);
+  }
 }
 
 export function parseArgs(rawArgs: string[]): {
@@ -132,6 +134,142 @@ Global Options:
 `);
 }
 
+import { DaemonClient } from "./daemon/client";
+
+export async function runStreamSession(config: Config, args: Record<string, unknown>): Promise<number> {
+  const daemon = new DaemonClient(config.serial);
+  let port: number;
+  try {
+    port = await daemon.ensureDaemon();
+  } catch (err: any) {
+    console.error(`Error: Failed to connect to or start u2bun daemon: ${err.message || String(err)}`);
+    return 1;
+  }
+
+  const format = args.format === "json" || config.json ? "json" : "text";
+  const sessionId = String(args.session_id || `cli_sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  const sseUrl = `http://127.0.0.1:${port}/session/stream?session_id=${sessionId}&format=${format}`;
+
+  const abortController = new AbortController();
+
+  let response: Response;
+  try {
+    response = await fetch(sseUrl, { signal: abortController.signal });
+  } catch (err: any) {
+    console.error(`Failed to connect to stream: ${err.message}`);
+    return 1;
+  }
+
+  if (!response.ok || !response.body) {
+    console.error(`Stream error: HTTP ${response.status}`);
+    return 1;
+  }
+
+  (async () => {
+    try {
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+
+        for (const block of parts) {
+          const lines = block.split("\n");
+          let eventType = "message";
+          const dataLines: string[] = [];
+
+          for (const line of lines) {
+            if (line.startsWith("event: ")) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith("data: ")) {
+              dataLines.push(line.slice(6));
+            }
+          }
+
+          if (eventType === "ping") continue;
+
+          if (dataLines.length > 0) {
+            console.log(dataLines.join("\n"));
+          }
+        }
+      }
+    } catch {}
+  })();
+
+  const readline = await import("node:readline");
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false,
+  });
+
+  for await (const line of rl) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed === "exit" || trimmed === "quit") {
+      break;
+    }
+
+    if (trimmed === "snapshot") {
+      try {
+        const res = await daemon.request("/snapshot", {
+          fingerprint: true,
+          include_handles: true,
+        });
+        if (format === "json") {
+          console.log(JSON.stringify(res));
+        } else if (res.snapshot) {
+          console.log(res.snapshot);
+        }
+      } catch (err: any) {
+        console.error(`[error] ${err.message || String(err)}`);
+      }
+      continue;
+    }
+
+    const tokens = trimmed.split(/\s+/);
+    let cmd = tokens[0];
+    const cmdArgs = tokens.slice(1);
+
+    if (cmd.startsWith("ui.")) cmd = cmd.slice(3);
+    const parsedLine = parseArgs([cmd, ...cmdArgs]);
+
+    try {
+      const res = await daemon.request("/action", {
+        command: parsedLine.domain || cmd,
+        args: parsedLine.toolArgs,
+      });
+
+      if (format === "json") {
+        console.log(JSON.stringify(res));
+      } else {
+        if (!res.ok) {
+          console.error(`[error] ${res.error || "Action failed"}`);
+        } else {
+          console.log("ok");
+        }
+      }
+    } catch (err: any) {
+      console.error(`[error] ${err.message || String(err)}`);
+    }
+  }
+
+  abortController.abort();
+  await fetch(`http://127.0.0.1:${port}/session/close`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId }),
+  }).catch(() => {});
+
+  return 0;
+}
+
 export async function runCli(argv: string[]): Promise<number> {
   const parsed = parseArgs(argv);
   const config = resolveConfig(parsed.configFlags);
@@ -144,6 +282,10 @@ export async function runCli(argv: string[]): Promise<number> {
   if (parsed.showHelp || (!parsed.domain && !parsed.subcommand)) {
     printHelp();
     return 0;
+  }
+
+  if (parsed.domain === "stream" || (parsed.domain === "daemon" && parsed.subcommand === "stream")) {
+    return await runStreamSession(config, parsed.toolArgs);
   }
 
   const domainName = parsed.domain;

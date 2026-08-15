@@ -5,7 +5,9 @@ import { DOMAINS } from "../../src/domains";
 describe("Registry & Capability Contract", () => {
   test("All domains and tools are registered", () => {
     for (const d of DOMAINS) {
-      registry.registerDomain(d);
+      if (!registry.hasDomain(d.name)) {
+        registry.registerDomain(d);
+      }
     }
 
     const tools = registry.listTools();

@@ -87,6 +87,14 @@ export class Registry {
     return this.domains.get(name);
   }
 
+  public hasDomain(name: string): boolean {
+    return this.domains.has(name);
+  }
+
+  public hasTool(name: string): boolean {
+    return this.tools.has(name);
+  }
+
   public listDomains(): DomainSpec[] {
     return Array.from(this.domains.values());
   }

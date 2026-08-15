@@ -132,7 +132,25 @@ Run everything as `bun run src/index.ts [--serial <SERIAL>] <domain> <command> [
 
 `run steps` composes any sequence, e.g. `run steps --steps '[{"tool":"ui.scroll","args":{"direction":"down"}},{"tool":"ui.snapshot","args":{}}]'`.
 
-### 1.4 Accented / non-ASCII text input
+### 1.4 Stream Mode (Persistent Live Session & Diffs)
+
+For multi-step interactive agent flows, use `u2bun stream` to eliminate process cold-starts and reduce LLM token consumption from ~35KB to <2KB:
+
+```bash
+bun run src/index.ts stream [--serial <SERIAL>] [--json]
+```
+
+- **Live SSE Channel:** Connects to daemon SSE stream `GET /session/stream`. Emits complete semantic snapshot on connect (`event: connected`).
+- **Live Semantic Diffs:** Submitting actions via stdin pushes ultra-compact delta updates (`event: diff` <200 chars):
+  ```text
+  [App: com.facebook.katana | diff: a1b2c3d4 -> e5f6a7b8]
+  - [@4] Button "Compartir"
+  + [@5] Button "Guardar"
+  ~ [@3] Button "2 comentarios" -> "3 comentarios" [focused]
+  ```
+- **Stdin Action DSL:** Send one action per line (`tap --ref @5`, `scroll --direction down`, `type --ref @2 --text "query"`, `snapshot`, `exit`).
+
+### 1.5 Accented / non-ASCII text input
 
 `ui input` **automatically** detects non-ASCII text and routes it through the AdbKeyboard IME broadcast (which preserves UTF-8). The response reports `input_method: "adb_keyboard"` (vs `"clipboard"` for plain ASCII).
 

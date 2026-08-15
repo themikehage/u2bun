@@ -3,7 +3,17 @@ import { join } from "node:path";
 import { writeFileSync, unlinkSync, existsSync, readFileSync } from "node:fs";
 import { DeviceSession } from "../runtime/device";
 import type { ActionElement } from "../models";
-import { parseXmlDump, computeScreenFingerprint, formatCompactSnapshot, checkExpect, sortByRelevance, deduplicateAndFilterElements } from "../domains/ui";
+import {
+  parseXmlDump,
+  computeScreenFingerprint,
+  formatCompactSnapshot,
+  checkExpect,
+  sortByRelevance,
+  deduplicateAndFilterElements,
+  computeSemanticDiff,
+  formatSemanticDiffCompact,
+  getSemanticRole,
+} from "../domains/ui";
 import { parseSelectorArgs } from "../selectors/parser";
 import { resolveSelector } from "../selectors/resolver";
 import { SelectorNotFoundError, UsageError } from "../errors";
@@ -22,6 +32,15 @@ export interface DaemonInfo {
   build_id: string;
 }
 
+export interface SseClient {
+  id: string;
+  controller: ReadableStreamDefaultController;
+  format: "text" | "json";
+  baseElements: ActionElement[];
+  baseFingerprint: string;
+  heartbeatInterval?: any;
+}
+
 export class DaemonServer {
   public serial: string;
   public port: number;
@@ -33,10 +52,68 @@ export class DaemonServer {
   private server: ReturnType<typeof Bun.serve> | null = null;
   private deviceInfoCache: { width: number; height: number } | null = null;
   private dedupCache: Map<string, ActionElement[]> = new Map();
+  private sseClients: Map<string, SseClient> = new Map();
 
   constructor(serial: string, port: number = 0) {
     this.serial = serial;
     this.port = port;
+  }
+
+  public broadcastDiff(nextElements: ActionElement[], nextFingerprint: string, packageName?: string): void {
+    if (this.sseClients.size === 0) return;
+    const encoder = new TextEncoder();
+
+    for (const [id, client] of this.sseClients.entries()) {
+      try {
+        const diff = computeSemanticDiff(client.baseElements, client.baseFingerprint, nextElements, nextFingerprint);
+        const isUnchanged = diff.added.length === 0 && diff.removed.length === 0 && diff.modified.length === 0;
+        if (isUnchanged) continue;
+
+        if (client.format === "json") {
+          const payload = JSON.stringify({
+            type: "diff",
+            session_id: id,
+            base_fingerprint: diff.baseFingerprint,
+            new_fingerprint: diff.newFingerprint,
+            added_count: diff.added.length,
+            removed_count: diff.removed.length,
+            modified_count: diff.modified.length,
+            added: diff.added.map((a) => ({ ref: a.ref, role: getSemanticRole(a), text: a.text || a.contentDesc, bounds: a.bounds })),
+            removed: diff.removed.map((r) => ({ ref: r.ref, role: getSemanticRole(r), text: r.text || r.contentDesc })),
+            modified: diff.modified.map((m) => ({ ref: m.ref, changes: m.changes })),
+          });
+          client.controller.enqueue(encoder.encode(`event: diff\ndata: ${payload}\n\n`));
+        } else {
+          const compactDiff = formatSemanticDiffCompact(diff, packageName);
+          const lines = compactDiff.split("\n").map((l) => `data: ${l}`).join("\n");
+          client.controller.enqueue(encoder.encode(`event: diff\n${lines}\n\n`));
+        }
+
+        client.baseElements = [...nextElements];
+        client.baseFingerprint = nextFingerprint;
+      } catch {
+        if (client.heartbeatInterval) clearInterval(client.heartbeatInterval);
+        this.sseClients.delete(id);
+      }
+    }
+  }
+
+  private async postActionSync(client: any): Promise<void> {
+    if (this.sseClients.size === 0) return;
+    try {
+      const postXml = await client.dumpHierarchy(true);
+      const raw = parseXmlDump(postXml, false, false);
+      const postElements = deduplicateAndFilterElements(raw);
+      const postFp = computeScreenFingerprint(postElements);
+      this.elements = postElements;
+      this.fingerprint = postFp;
+      let pkg = "";
+      try {
+        const info = await client.deviceInfo();
+        pkg = info.currentPackageName || "";
+      } catch {}
+      this.broadcastDiff(postElements, postFp, pkg);
+    } catch {}
   }
 
   private async getScreenDimensions(client: any): Promise<{ width: number; height: number }> {
@@ -102,6 +179,109 @@ export class DaemonServer {
               error: err.message || String(err),
             }, { status: 503 });
           }
+        }
+
+        if (url.pathname === "/session/open" && req.method === "POST") {
+          const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          return Response.json({ ok: true, session_id: sessionId });
+        }
+
+        if (url.pathname === "/session/close" && req.method === "POST") {
+          const body = await req.json().catch(() => ({}));
+          const sessionId = body.session_id;
+          if (sessionId && self.sseClients.has(sessionId)) {
+            const client = self.sseClients.get(sessionId)!;
+            if (client.heartbeatInterval) clearInterval(client.heartbeatInterval);
+            try { client.controller.close(); } catch {}
+            self.sseClients.delete(sessionId);
+          }
+          return Response.json({ ok: true });
+        }
+
+        if (url.pathname === "/session/stream" && req.method === "GET") {
+          const sessionId = url.searchParams.get("session_id") || `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          const format = (url.searchParams.get("format") === "json" ? "json" : "text") as "text" | "json";
+
+          let clientObj: SseClient;
+          const stream = new ReadableStream({
+            async start(controller) {
+              const encoder = new TextEncoder();
+              const heartbeat = setInterval(() => {
+                try {
+                  controller.enqueue(encoder.encode(`event: ping\ndata: {"ts":${Date.now()}}\n\n`));
+                } catch {
+                  clearInterval(heartbeat);
+                  self.sseClients.delete(sessionId);
+                }
+              }, 15000);
+
+              let initialSnapshot = "";
+              let initialFp = self.fingerprint;
+              let initialElements = self.elements;
+              let packageName = "";
+
+              try {
+                const session = await self.getSession();
+                const client = session.client!;
+                try {
+                  const info = await client.deviceInfo();
+                  packageName = info.currentPackageName || "";
+                } catch {}
+
+                if (initialElements.length === 0) {
+                  const xml = await client.dumpHierarchy(true);
+                  const raw = parseXmlDump(xml, false, false);
+                  initialElements = deduplicateAndFilterElements(raw);
+                  self.elements = initialElements;
+                  initialFp = computeScreenFingerprint(initialElements);
+                  self.fingerprint = initialFp;
+                }
+
+                initialSnapshot = formatCompactSnapshot(initialElements, packageName, initialFp);
+              } catch (err: any) {
+                initialSnapshot = `[App: active | error: ${err.message || String(err)}]`;
+              }
+
+              clientObj = {
+                id: sessionId,
+                controller,
+                format,
+                baseElements: [...initialElements],
+                baseFingerprint: initialFp,
+                heartbeatInterval: heartbeat,
+              };
+              self.sseClients.set(sessionId, clientObj);
+
+              if (format === "json") {
+                const payload = JSON.stringify({
+                  type: "snapshot",
+                  session_id: sessionId,
+                  screen_fingerprint: initialFp,
+                  snapshot: initialSnapshot,
+                  element_count: initialElements.length,
+                });
+                controller.enqueue(encoder.encode(`event: connected\ndata: ${payload}\n\n`));
+              } else {
+                const lines = initialSnapshot.split("\n").map((l) => `data: ${l}`).join("\n");
+                controller.enqueue(encoder.encode(`event: connected\n${lines}\n\n`));
+              }
+            },
+            cancel() {
+              if (clientObj?.heartbeatInterval) {
+                clearInterval(clientObj.heartbeatInterval);
+              }
+              self.sseClients.delete(sessionId);
+            },
+          });
+
+          return new Response(stream, {
+            headers: {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache, no-transform",
+              "Connection": "keep-alive",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
         }
 
         if (url.pathname === "/snapshot" && req.method === "POST") {
@@ -183,6 +363,8 @@ export class DaemonServer {
                 handleObj[k] = { text: v.text, resourceId: v.resourceId, bounds: v.bounds };
               });
             }
+
+            self.broadcastDiff(self.elements, self.fingerprint, packageName);
 
             return Response.json({
               ok: true,
@@ -290,7 +472,7 @@ export class DaemonServer {
           }
         }
 
-        if (url.pathname === "/action" && req.method === "POST") {
+        if ((url.pathname === "/action" || url.pathname === "/session/action") && req.method === "POST") {
           try {
             const body = await req.json();
             const { command, args } = body;
@@ -356,6 +538,8 @@ export class DaemonServer {
                 if (matchedElem) postcondition.matched_element = matchedElem;
               }
 
+              await self.postActionSync(client);
+
               return Response.json({
                 ok: true,
                 result: {
@@ -400,6 +584,8 @@ export class DaemonServer {
                 if (matchedElem) postcondition.matched_element = matchedElem;
               }
 
+              await self.postActionSync(client);
+
               return Response.json({
                 ok: true,
                 result: {
@@ -416,6 +602,7 @@ export class DaemonServer {
                 await client.clearInputText();
               }
               const inputMethod = await session.setInputText(args.text);
+              await self.postActionSync(client);
               return Response.json({
                 ok: true,
                 result: {
@@ -449,6 +636,7 @@ export class DaemonServer {
 
               const steps = args.duration_steps ?? Math.round((args.duration ?? 0.2) * 100);
               await client.swipe(fx, fy, tx, ty, steps);
+              await self.postActionSync(client);
 
               return Response.json({
                 ok: true,
@@ -484,6 +672,7 @@ export class DaemonServer {
 
               const steps = Math.round(duration * 100);
               await client.swipe(fx, fy, tx, ty, steps);
+              await self.postActionSync(client);
 
               return Response.json({
                 ok: true,
@@ -539,6 +728,7 @@ export class DaemonServer {
                 const [satisfied, matchedElem] = checkExpect(args, postElements);
                 postcondition.expect_satisfied = satisfied;
                 if (matchedElem) postcondition.matched_element = matchedElem;
+                await self.postActionSync(client);
                 return Response.json({
                   ok: true,
                   result: {
@@ -548,6 +738,8 @@ export class DaemonServer {
                   },
                 });
               }
+
+              await self.postActionSync(client);
 
               return Response.json({
                 ok: true,
@@ -560,6 +752,7 @@ export class DaemonServer {
 
             if (command === "press") {
               await client.pressKey(String(args.key).toLowerCase());
+              await self.postActionSync(client);
 
               return Response.json({
                 ok: true,
@@ -733,6 +926,11 @@ export class DaemonServer {
   }
 
   public stop(): void {
+    for (const client of this.sseClients.values()) {
+      if (client.heartbeatInterval) clearInterval(client.heartbeatInterval);
+      try { client.controller.close(); } catch {}
+    }
+    this.sseClients.clear();
     if (this.server) {
       this.server.stop();
       this.server = null;

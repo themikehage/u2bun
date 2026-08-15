@@ -298,6 +298,203 @@ export function formatCompactSnapshot(
   return [header, ...lines].join("\n");
 }
 
+export function computeNodeKey(el: ActionElement): string {
+  const rect = parseBoundsRect(el.bounds);
+  let boundsGrid = "0,0,0,0";
+  if (rect) {
+    const gx1 = Math.floor(rect.x1 / 10) * 10;
+    const gy1 = Math.floor(rect.y1 / 10) * 10;
+    const gx2 = Math.floor(rect.x2 / 10) * 10;
+    const gy2 = Math.floor(rect.y2 / 10) * 10;
+    boundsGrid = `${gx1},${gy1},${gx2},${gy2}`;
+  }
+  const cls = el.className || "";
+  const label = (el.contentDesc || el.text || "").trim().slice(0, 32);
+  const resId = (el.resourceId || "").trim();
+  return `${cls}|${resId}|${label}|${boundsGrid}`;
+}
+
+export interface ModifiedEntry {
+  ref: string;
+  oldElement?: ActionElement;
+  newElement?: ActionElement;
+  changes: Partial<Pick<ActionElement, "text" | "contentDesc" | "focused" | "clickable">>;
+}
+
+export interface SemanticDiff {
+  baseFingerprint: string;
+  newFingerprint: string;
+  added: ActionElement[];
+  removed: ActionElement[];
+  modified: ModifiedEntry[];
+}
+
+export function computeSemanticDiff(
+  base: ActionElement[],
+  baseFingerprint: string,
+  next: ActionElement[],
+  nextFingerprint: string
+): SemanticDiff {
+  if (baseFingerprint && nextFingerprint && baseFingerprint === nextFingerprint) {
+    return {
+      baseFingerprint,
+      newFingerprint: nextFingerprint,
+      added: [],
+      removed: [],
+      modified: [],
+    };
+  }
+
+  const buildMap = (elements: ActionElement[]) => {
+    const map = new Map<string, ActionElement>();
+    const counts = new Map<string, number>();
+    for (let i = 0; i < elements.length; i++) {
+      const el = elements[i];
+      const baseKey = computeNodeKey(el);
+      const count = counts.get(baseKey) || 0;
+      counts.set(baseKey, count + 1);
+      const key = count === 0 ? baseKey : `${baseKey}#${count}`;
+      map.set(key, el);
+    }
+    return map;
+  };
+
+  const baseMap = buildMap(base);
+  const nextMap = buildMap(next);
+
+  const added: ActionElement[] = [];
+  const removed: ActionElement[] = [];
+  const modified: ModifiedEntry[] = [];
+
+  for (const [key, nextEl] of nextMap.entries()) {
+    if (baseMap.has(key)) {
+      const baseEl = baseMap.get(key)!;
+      const textChanged = (baseEl.text || "") !== (nextEl.text || "");
+      const descChanged = (baseEl.contentDesc || "") !== (nextEl.contentDesc || "");
+      const focusedChanged = Boolean(baseEl.focused) !== Boolean(nextEl.focused);
+      const clickableChanged = Boolean(baseEl.clickable) !== Boolean(nextEl.clickable);
+
+      if (textChanged || descChanged || focusedChanged || clickableChanged) {
+        modified.push({
+          ref: baseEl.ref || nextEl.ref || `@${nextEl.index + 1}`,
+          oldElement: baseEl,
+          newElement: nextEl,
+          changes: {
+            ...(textChanged ? { text: nextEl.text } : {}),
+            ...(descChanged ? { contentDesc: nextEl.contentDesc } : {}),
+            ...(focusedChanged ? { focused: nextEl.focused } : {}),
+            ...(clickableChanged ? { clickable: nextEl.clickable } : {}),
+          },
+        });
+      }
+    } else {
+      added.push(nextEl);
+    }
+  }
+
+  for (const [key, baseEl] of baseMap.entries()) {
+    if (!nextMap.has(key)) {
+      removed.push(baseEl);
+    }
+  }
+
+  // Detect in-place mutations (e.g. text changed in same button with identical/high overlap bounds and same class)
+  for (let r = removed.length - 1; r >= 0; r--) {
+    const rem = removed[r];
+    const remRect = parseBoundsRect(rem.bounds);
+    if (!remRect) continue;
+
+    for (let a = added.length - 1; a >= 0; a--) {
+      const add = added[a];
+      const addRect = parseBoundsRect(add.bounds);
+      if (!addRect) continue;
+
+      const sameClass = rem.className === add.className;
+      const sameResId = !rem.resourceId || !add.resourceId || rem.resourceId === add.resourceId;
+      const overlap = rectOverlapRatio(remRect, addRect);
+
+      if (sameClass && sameResId && overlap >= 0.85) {
+        const textChanged = (rem.text || "") !== (add.text || "");
+        const descChanged = (rem.contentDesc || "") !== (add.contentDesc || "");
+        const focusedChanged = Boolean(rem.focused) !== Boolean(add.focused);
+        const clickableChanged = Boolean(rem.clickable) !== Boolean(add.clickable);
+
+        modified.push({
+          ref: rem.ref || add.ref || `@${add.index + 1}`,
+          oldElement: rem,
+          newElement: add,
+          changes: {
+            ...(textChanged ? { text: add.text } : {}),
+            ...(descChanged ? { contentDesc: add.contentDesc } : {}),
+            ...(focusedChanged ? { focused: add.focused } : {}),
+            ...(clickableChanged ? { clickable: add.clickable } : {}),
+          },
+        });
+
+        removed.splice(r, 1);
+        added.splice(a, 1);
+        break;
+      }
+    }
+  }
+
+  return {
+    baseFingerprint,
+    newFingerprint: nextFingerprint,
+    added,
+    removed,
+    modified,
+  };
+}
+
+export function formatSemanticDiffCompact(diff: SemanticDiff, packageName?: string): string {
+  const isUnchanged = diff.added.length === 0 && diff.removed.length === 0 && diff.modified.length === 0;
+  if (isUnchanged) {
+    return `[App: ${packageName || "active"} | unchanged]`;
+  }
+
+  const header = `[App: ${packageName || "active"} | diff: ${diff.baseFingerprint || "init"} -> ${diff.newFingerprint}]`;
+  const lines: string[] = [header];
+
+  for (const rem of diff.removed) {
+    const role = getSemanticRole(rem);
+    const label = rem.text || rem.contentDesc || "";
+    const labelStr = label ? ` "${label}"` : "";
+    lines.push(`- [${rem.ref || `@${rem.index + 1}`}] ${role}${labelStr}`);
+  }
+
+  for (const add of diff.added) {
+    const role = getSemanticRole(add);
+    const label = add.text || add.contentDesc || "";
+    const labelStr = label ? ` "${label}"` : "";
+    lines.push(`+ [${add.ref || `@${add.index + 1}`}] ${role}${labelStr}`);
+  }
+
+  for (const mod of diff.modified) {
+    const role = mod.newElement
+      ? getSemanticRole(mod.newElement)
+      : mod.oldElement
+      ? getSemanticRole(mod.oldElement)
+      : "Item";
+    const oldLabel = mod.oldElement ? (mod.oldElement.text || mod.oldElement.contentDesc || "") : "";
+    const newLabel = mod.newElement ? (mod.newElement.text || mod.newElement.contentDesc || "") : "";
+
+    const stateFlags: string[] = [];
+    if (mod.changes.focused !== undefined) stateFlags.push(mod.changes.focused ? "focused" : "unfocused");
+    if (mod.changes.clickable !== undefined) stateFlags.push(mod.changes.clickable ? "clickable" : "disabled");
+    const stateStr = stateFlags.length > 0 ? ` [${stateFlags.join(", ")}]` : "";
+
+    if (oldLabel !== newLabel) {
+      lines.push(`~ [${mod.ref}] ${role} "${oldLabel}" -> "${newLabel}"${stateStr}`);
+    } else {
+      const labelStr = newLabel ? ` "${newLabel}"` : "";
+      lines.push(`~ [${mod.ref}] ${role}${labelStr}${stateStr}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 function decodeXmlEntities(str: string): string {
   if (!str) return str;
   return str
