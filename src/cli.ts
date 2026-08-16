@@ -3,6 +3,7 @@ import { formatSuccessEnvelope, formatErrorEnvelope, renderOutput } from "./outp
 import { U2Error, UsageError, InternalError } from "./errors";
 import { registry, type HandlerContext } from "./registry";
 import { DOMAINS } from "./domains";
+import { SessionStore } from "./session/store";
 
 // Register all domains at startup if not already registered
 for (const domain of DOMAINS) {
@@ -60,6 +61,10 @@ export function parseArgs(rawArgs: string[]): {
       configFlags.json = true;
     } else if (arg === "--strict-selector") {
       configFlags.strictSelector = true;
+    } else if (arg === "--session-dir") {
+      configFlags.sessionDir = rawArgs[++i];
+    } else if (arg.startsWith("--session-dir=")) {
+      configFlags.sessionDir = arg.split("=", 2)[1];
     } else if (arg.startsWith("--no-")) {
       const key = toSnakeCase(arg.slice(5));
       toolArgs[key] = false;
@@ -317,6 +322,7 @@ export async function runCli(argv: string[]): Promise<number> {
     timeout: config.timeout,
     debug: config.debug,
     warnings,
+    sessionDir: config.sessionDir,
     warn: (msg: string) => warnings.push(msg),
     callTool: async (name: string, args: Record<string, unknown>) => {
       const subTool = registry.getTool(name);
@@ -327,6 +333,7 @@ export async function runCli(argv: string[]): Promise<number> {
     },
   };
 
+  const startTime = Date.now();
   try {
     const validatedArgs = tool.inputSchema.parse(parsed.toolArgs);
     const result = await tool.handler(ctx, validatedArgs);
@@ -334,10 +341,25 @@ export async function runCli(argv: string[]): Promise<number> {
 
     await registry.verifyPostcondition(ctx, tool, validatedResult);
 
+    const durationSec = Number(((Date.now() - startTime) / 1000).toFixed(3));
+    if (tool.name !== "session.start" && tool.name !== "session.end" && tool.name !== "session.status") {
+      SessionStore.recordCall(
+        {
+          tool: tool.name,
+          args: validatedArgs,
+          result: validatedResult,
+          duration_sec: durationSec,
+          started_at: new Date(startTime).toISOString(),
+        },
+        config.sessionDir
+      );
+    }
+
     const envelope = formatSuccessEnvelope(tool.name, ctx.serial, validatedResult, warnings);
     renderOutput(envelope, config.quiet, config.json);
     return 0;
   } catch (error: any) {
+    const durationSec = Number(((Date.now() - startTime) / 1000).toFixed(3));
     let uError: U2Error;
     if (error instanceof U2Error) {
       uError = error;
@@ -345,6 +367,23 @@ export async function runCli(argv: string[]): Promise<number> {
       uError = new UsageError(`Validation error: ${error.message}`);
     } else {
       uError = new InternalError(error.message || String(error));
+    }
+
+    if (tool.name !== "session.start" && tool.name !== "session.end" && tool.name !== "session.status") {
+      SessionStore.recordCall(
+        {
+          tool: tool.name,
+          args: parsed.toolArgs,
+          error: {
+            code: uError.code,
+            message: uError.message,
+            exit_code: uError.exitCode,
+          },
+          duration_sec: durationSec,
+          started_at: new Date(startTime).toISOString(),
+        },
+        config.sessionDir
+      );
     }
 
     const envelope = formatErrorEnvelope(tool.name, uError, ctx.serial, warnings);

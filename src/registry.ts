@@ -8,6 +8,7 @@ export interface HandlerContext {
   timeout: number;
   debug: boolean;
   warnings: string[];
+  sessionDir?: string;
   callTool: <T = Record<string, unknown>>(toolName: string, args: Record<string, unknown>) => Promise<T>;
   warn: (message: string) => void;
 }

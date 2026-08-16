@@ -133,6 +133,24 @@ export function renderOutput(
       return;
     }
 
+    // 2b. Session recording commands
+    if (envelope.command === "session.start") {
+      console.log(`ok\tsession:${res.session_id}`);
+      return;
+    }
+    if (envelope.command === "session.end") {
+      console.log(`ok\tfile:${res.file}\tcalls:${res.summary?.total_calls ?? 0}\tduration:${res.duration_sec ?? 0}s`);
+      return;
+    }
+    if (envelope.command === "session.status") {
+      if (!res.active) {
+        console.log("inactive");
+      } else {
+        console.log(`active\tsession:${res.session_id}\tcalls:${res.total_calls ?? 0}`);
+      }
+      return;
+    }
+
     // 3. Action commands: check by command name or action flags
     const ACTION_COMMANDS = new Set([
       "ui.tap",
