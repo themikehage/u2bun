@@ -21,7 +21,7 @@ describe("v2 Recommendations & Robustness Fixes", () => {
       debug: false,
       warnings: [],
       warn: () => {},
-      callTool: async () => ({}),
+      callTool: async () => ({} as any),
     };
 
     const mutationTool: ToolSpec = {

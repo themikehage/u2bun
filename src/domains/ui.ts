@@ -1,12 +1,62 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
+import * as path from "node:path";
 import type { DomainSpec } from "../registry";
 import { DeviceSession } from "../runtime/device";
+import { selectTargetDevice, execAdb } from "../runtime/adb";
 import type { ActionElement } from "../models";
 import { parseSelectorArgs, parseBoundsRect } from "../selectors/parser";
 import { resolveSelector, rectOverlapRatio, OVERLAP_MERGE } from "../selectors/resolver";
-import { SelectorNotFoundError, TimeoutError, UsageError } from "../errors";
+import { SelectorNotFoundError, TimeoutError, UsageError, U2Error, ExitCode } from "../errors";
 import { DaemonClient } from "../daemon/client";
+
+export interface ParsedNotification {
+  package: string;
+  title: string;
+  text: string;
+}
+
+export function parseNotificationDumpsys(raw: string): ParsedNotification[] {
+  const notifs: ParsedNotification[] = [];
+  const records = raw.split(/NotificationRecord\(|Notification\s*\{/i);
+
+  for (const block of records) {
+    if (!block.trim()) continue;
+
+    const pkgMatch = block.match(/pkg=([^\s,}]+)/i) || block.match(/package=([^\s,}]+)/i);
+    const pkg = pkgMatch ? pkgMatch[1] : "";
+    if (!pkg || pkg === "com.android.systemui") continue;
+
+    let title = "";
+    const titleMatch =
+      block.match(/android\.title=(?:String|CharSequence)\s*\(([^)]*)\)/i) ||
+      block.match(/android\.title=([^\n,]+)/i);
+    if (titleMatch) title = titleMatch[1].trim();
+
+    let text = "";
+    const textMatch =
+      block.match(/android\.text=(?:String|CharSequence)\s*\(([^)]*)\)/i) ||
+      block.match(/android\.bigText=(?:String|CharSequence)\s*\(([^)]*)\)/i) ||
+      block.match(/tickerText=([^\n,]+)/i);
+    if (textMatch) text = textMatch[1].trim();
+
+    if (title || text) {
+      notifs.push({ package: pkg, title, text });
+    }
+  }
+
+  const unique: ParsedNotification[] = [];
+  const seen = new Set<string>();
+  for (const n of notifs) {
+    const key = `${n.package}:${n.title}:${n.text}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(n);
+    }
+  }
+
+  return unique;
+}
 
 const ACTIONABLE_CLASSES = new Set([
   "android.widget.Button",
@@ -1177,11 +1227,13 @@ export const UI_DOMAIN: DomainSpec = {
       inputSchema: z.object({
         direction: z.enum(["down", "up", "left", "right"]).optional().default("down"),
         duration: z.number().optional().default(0.3),
+        snapshot: z.boolean().optional().default(false).describe("Capture and return updated snapshot after scroll"),
         use_daemon: z.boolean().optional().default(true),
       }),
       outputSchema: z.object({
         swiped: z.boolean(),
         direction: z.string(),
+        snapshot: z.string().optional(),
         screen_fingerprint: z.string().optional(),
       }),
       safety: "interactive",
@@ -1189,7 +1241,7 @@ export const UI_DOMAIN: DomainSpec = {
         schema: z.object({ swiped: z.literal(true) }),
       },
       handler: async (ctx, args) => {
-        if (args.use_daemon) {
+        if (args.use_daemon && !args.snapshot) {
           try {
             const daemonClient = new DaemonClient(ctx.serial);
             const daemonRes = await daemonClient.action("scroll", args);
@@ -1226,6 +1278,16 @@ export const UI_DOMAIN: DomainSpec = {
 
         const steps = Math.round(duration * 100);
         await client.swipe(fx, fy, tx, ty, steps);
+
+        if (args.snapshot) {
+          await new Promise((r) => setTimeout(r, 200));
+          const snapRes = await ctx.callTool<{ snapshot: string }>("ui.snapshot", {});
+          return {
+            swiped: true,
+            direction: dir,
+            snapshot: snapRes.snapshot,
+          };
+        }
 
         return {
           swiped: true,
@@ -1316,7 +1378,7 @@ export const UI_DOMAIN: DomainSpec = {
       domain: "ui",
       description: "Press hardware key or navigation key (back, home, enter, etc.)",
       inputSchema: z.object({
-        key: z.string().describe("Key name (e.g. back, home, enter, delete, volume_up)"),
+        key: z.string().describe("Key name (e.g. back, home, enter, power, menu, delete, volume_up, volume_down, tab, recent, search)"),
         use_daemon: z.boolean().optional().default(true),
       }),
       outputSchema: z.object({
@@ -1348,6 +1410,26 @@ export const UI_DOMAIN: DomainSpec = {
           key: args.key,
           pressed: true,
         };
+      },
+    },
+    {
+      name: "ui.keyboard_hide",
+      domain: "ui",
+      description: "Dismiss virtual soft keyboard / IME if currently open",
+      inputSchema: z.object({}),
+      outputSchema: z.object({
+        hidden: z.boolean(),
+      }),
+      safety: "interactive",
+      expect: {
+        schema: z.object({ hidden: z.literal(true) }),
+      },
+      handler: async (ctx) => {
+        const { target } = await selectTargetDevice(ctx.serial);
+        ctx.serial = target.serial;
+        // Keyevent 111 is KEYCODE_ESCAPE which hides soft keyboard without triggering back navigation
+        await execAdb(["-s", target.serial, "shell", "input", "keyevent", "111"]);
+        return { hidden: true };
       },
     },
     {
@@ -1529,6 +1611,271 @@ export const UI_DOMAIN: DomainSpec = {
             scrollsPerformed++;
           }
         }
+      },
+    },
+    {
+      name: "ui.notifications",
+      domain: "ui",
+      description: "Manage and inspect Android system notifications (expand, collapse, read)",
+      inputSchema: z.object({
+        action: z.enum(["expand", "collapse", "read"]).optional().default("read").describe("Action: expand, collapse, or read notifications"),
+      }),
+      outputSchema: z.object({
+        action: z.string(),
+        success: z.boolean(),
+        notifications: z.array(
+          z.object({
+            package: z.string(),
+            title: z.string(),
+            text: z.string(),
+          })
+        ).optional(),
+        count: z.number().optional(),
+      }),
+      safety: "interactive",
+      expect: {
+        schema: z.object({ success: z.literal(true) }),
+      },
+      handler: async (ctx, args) => {
+        const { target } = await selectTargetDevice(ctx.serial);
+        ctx.serial = target.serial;
+
+        if (args.action === "expand") {
+          let ok = false;
+          try {
+            const session = new DeviceSession(ctx.serial, ctx.timeout);
+            const client = await session.connect();
+            ok = await client.openNotification();
+          } catch {}
+
+          if (!ok) {
+            await execAdb(["-s", target.serial, "shell", "cmd", "statusbar", "expand-notifications"]);
+          }
+          return { action: "expand", success: true };
+        } else if (args.action === "collapse") {
+          await execAdb(["-s", target.serial, "shell", "cmd", "statusbar", "collapse"]);
+          return { action: "collapse", success: true };
+        } else {
+          // read
+          let rawDumpsys = "";
+          try {
+            const res = await execAdb(["-s", target.serial, "shell", "dumpsys", "notification", "--noredact"]);
+            rawDumpsys = res.stdout;
+          } catch {
+            const res = await execAdb(["-s", target.serial, "shell", "dumpsys", "notification"]);
+            rawDumpsys = res.stdout;
+          }
+
+          const notifications = parseNotificationDumpsys(rawDumpsys);
+          return {
+            action: "read",
+            notifications,
+            count: notifications.length,
+            success: true,
+          };
+        }
+      },
+    },
+    {
+      name: "ui.screenshot",
+      domain: "ui",
+      description: "Capture PNG screenshot of device display and save to local path",
+      inputSchema: z.object({
+        output: z.string().optional().describe("Local filesystem path for PNG image (defaults to ./screenshot_<timestamp>.png)"),
+      }),
+      outputSchema: z.object({
+        path: z.string(),
+        size_bytes: z.number(),
+        success: z.boolean(),
+      }),
+      safety: "read",
+      handler: async (ctx, args) => {
+        const { target } = await selectTargetDevice(ctx.serial);
+        ctx.serial = target.serial;
+
+        const outPath = args.output || path.join(process.cwd(), `screenshot_${Date.now()}.png`);
+        const proc = Bun.spawn(["adb", "-s", target.serial, "exec-out", "screencap", "-p"], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+
+        const bytes = await Bun.readableStreamToArrayBuffer(proc.stdout);
+        if (bytes.byteLength === 0) {
+          throw new U2Error("DEVICE_OFFLINE", "Failed to capture screenshot from device", ExitCode.DEVICE, true, "Verify device connection");
+        }
+
+        await Bun.write(outPath, bytes);
+
+        return {
+          path: outPath,
+          size_bytes: bytes.byteLength,
+          success: true,
+        };
+      },
+    },
+    {
+      name: "ui.drag",
+      domain: "ui",
+      description: "Drag from source element or coordinates to destination element or coordinates",
+      inputSchema: z.object({
+        from_ref: handleRefSchema.describe("Source element handle (e.g. @1)"),
+        to_ref: handleRefSchema.describe("Destination element handle (e.g. @2)"),
+        from_pos: z.string().optional().describe("Source coordinates 'X,Y'"),
+        to_pos: z.string().optional().describe("Destination coordinates 'X,Y'"),
+        from_x: z.number().optional(),
+        from_y: z.number().optional(),
+        to_x: z.number().optional(),
+        to_y: z.number().optional(),
+        steps: z.number().optional().default(40).describe("Drag interpolation steps (default 40)"),
+      }),
+      outputSchema: z.object({
+        dragged: z.boolean(),
+        from: z.object({ x: z.number(), y: z.number() }),
+        to: z.object({ x: z.number(), y: z.number() }),
+      }),
+      safety: "interactive",
+      expect: {
+        schema: z.object({ dragged: z.literal(true) }),
+      },
+      handler: async (ctx, args) => {
+        const session = new DeviceSession(ctx.serial, ctx.timeout);
+        const client = await session.connect();
+        ctx.serial = session.serial;
+
+        let fromX = args.from_x;
+        let fromY = args.from_y;
+        let toX = args.to_x;
+        let toY = args.to_y;
+
+        if (args.from_pos) {
+          const parts = args.from_pos.split(",").map(Number);
+          if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+            fromX = parts[0];
+            fromY = parts[1];
+          }
+        }
+        if (args.to_pos) {
+          const parts = args.to_pos.split(",").map(Number);
+          if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+            toX = parts[0];
+            toY = parts[1];
+          }
+        }
+
+        if (fromX === undefined || fromY === undefined || toX === undefined || toY === undefined) {
+          const xml = await client.dumpHierarchy(true);
+          const rawElements = parseXmlDump(xml, true, false);
+          const elements = deduplicateAndFilterElements(rawElements);
+
+          if (fromX === undefined || fromY === undefined) {
+            if (!args.from_ref) {
+              throw new UsageError("Missing source: specify --from-ref or --from-pos / --from-x/y");
+            }
+            const query = parseSelectorArgs({ ref: args.from_ref });
+            const matched = resolveSelector(elements, query, false, rawElements);
+            fromX = matched.centerX;
+            fromY = matched.centerY;
+          }
+
+          if (toX === undefined || toY === undefined) {
+            if (!args.to_ref) {
+              throw new UsageError("Missing destination: specify --to-ref or --to-pos / --to-x/y");
+            }
+            const query = parseSelectorArgs({ ref: args.to_ref });
+            const matched = resolveSelector(elements, query, false, rawElements);
+            toX = matched.centerX;
+            toY = matched.centerY;
+          }
+        }
+
+        await client.drag(fromX, fromY, toX, toY, args.steps);
+
+        return {
+          dragged: true,
+          from: { x: fromX, y: fromY },
+          to: { x: toX, y: toY },
+        };
+      },
+    },
+    {
+      name: "ui.pinch",
+      domain: "ui",
+      description: "Perform two-pointer pinch gesture (in or out) on an element or screen region",
+      inputSchema: z.object({
+        ref: handleRefSchema.describe("Element handle to pinch within (e.g. @1)"),
+        pos: z.string().optional().describe("Center coordinate 'X,Y'"),
+        cx: z.number().optional(),
+        cy: z.number().optional(),
+        direction: z.enum(["in", "out"]).optional().default("in").describe("Direction: 'in' (zoom out) or 'out' (zoom in)"),
+        percent: z.number().optional().default(50).describe("Pinch scale percent 1-100 (default 50)"),
+        steps: z.number().optional().default(30).describe("Gesture steps (default 30)"),
+      }),
+      outputSchema: z.object({
+        pinched: z.boolean(),
+        direction: z.string(),
+        center: z.object({ x: z.number(), y: z.number() }),
+      }),
+      safety: "interactive",
+      expect: {
+        schema: z.object({ pinched: z.literal(true) }),
+      },
+      handler: async (ctx, args) => {
+        const session = new DeviceSession(ctx.serial, ctx.timeout);
+        const client = await session.connect();
+        ctx.serial = session.serial;
+
+        let boundsRect: { x1: number; y1: number; x2: number; y2: number } | null = null;
+        let centerX = args.cx;
+        let centerY = args.cy;
+
+        if (args.pos) {
+          const parts = args.pos.split(",").map(Number);
+          if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+            centerX = parts[0];
+            centerY = parts[1];
+          }
+        }
+
+        if (args.ref) {
+          const xml = await client.dumpHierarchy(true);
+          const rawElements = parseXmlDump(xml, true, false);
+          const elements = deduplicateAndFilterElements(rawElements);
+          const query = parseSelectorArgs({ ref: args.ref });
+          const matched = resolveSelector(elements, query, false, rawElements);
+          centerX = matched.centerX;
+          centerY = matched.centerY;
+          boundsRect = parseBoundsRect(matched.element.bounds);
+        }
+
+        if (!boundsRect) {
+          const info = await client.deviceInfo();
+          const w = info.displayWidth || 1080;
+          const h = info.displayHeight || 2340;
+          if (centerX === undefined || centerY === undefined) {
+            centerX = Math.round(w / 2);
+            centerY = Math.round(h / 2);
+          }
+          const radiusX = Math.round(w * 0.35);
+          const radiusY = Math.round(h * 0.35);
+          boundsRect = {
+            x1: Math.max(0, centerX - radiusX),
+            y1: Math.max(0, centerY - radiusY),
+            x2: Math.min(w, centerX + radiusX),
+            y2: Math.min(h, centerY + radiusY),
+          };
+        }
+
+        if (args.direction === "out") {
+          await client.pinchOut(boundsRect, args.percent, args.steps);
+        } else {
+          await client.pinchIn(boundsRect, args.percent, args.steps);
+        }
+
+        return {
+          pinched: true,
+          direction: args.direction,
+          center: { x: centerX, y: centerY },
+        };
       },
     },
   ],

@@ -163,7 +163,7 @@ export class DaemonClient {
       try {
         const healthRes = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1000) });
         if (healthRes.ok) {
-          health = await healthRes.json();
+          health = (await healthRes.json()) as Record<string, unknown>;
         }
       } catch {}
 
@@ -179,6 +179,29 @@ export class DaemonClient {
     }
   }
 
+  public async request(endpoint: string, data: any = {}): Promise<any> {
+    const cleanEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const port = await this.ensureDaemon();
+        const res = await fetch(`http://127.0.0.1:${port}${cleanEndpoint}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Connection: "keep-alive" },
+          body: JSON.stringify(data),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) {
+          const err: any = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(`Daemon request ${endpoint} failed: ${err.error || res.statusText}`);
+        }
+        return await res.json();
+      } catch (err: any) {
+        this.port = null;
+        if (attempt === 1) throw err;
+      }
+    }
+  }
+
   public async snapshot(args: Record<string, unknown> = {}): Promise<any> {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -190,7 +213,7 @@ export class DaemonClient {
           signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) {
-          const err = await res.json().catch(() => ({ error: res.statusText }));
+          const err: any = await res.json().catch(() => ({ error: res.statusText }));
           throw new Error(`Daemon snapshot failed: ${err.error || res.statusText}`);
         }
         return await res.json();
@@ -212,7 +235,7 @@ export class DaemonClient {
           signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) {
-          const err = await res.json().catch(() => ({ error: res.statusText }));
+          const err: any = await res.json().catch(() => ({ error: res.statusText }));
           throw new Error(`Daemon state failed: ${err.error || res.statusText}`);
         }
         return await res.json();
@@ -234,7 +257,7 @@ export class DaemonClient {
           signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) {
-          const err = await res.json().catch(() => ({ error: res.statusText }));
+          const err: any = await res.json().catch(() => ({ error: res.statusText }));
           throw new Error(`Daemon dump failed: ${err.error || res.statusText}`);
         }
         return await res.json();
@@ -256,7 +279,7 @@ export class DaemonClient {
           signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) {
-          const err = await res.json().catch(() => ({ error: res.statusText }));
+          const err: any = await res.json().catch(() => ({ error: res.statusText }));
           throw new Error(`Daemon action failed: ${err.error || res.statusText}`);
         }
         return await res.json();

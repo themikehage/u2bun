@@ -9,7 +9,7 @@ export class DeviceSession {
   public adbPath?: string;
   public localPort: number;
 
-  private client?: U2Client;
+  public client?: U2Client;
 
   constructor(serial?: string, timeout: number = 30, adbPath?: string, localPort: number = 9008) {
     if (serial) this.serial = serial;

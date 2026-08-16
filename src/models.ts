@@ -10,14 +10,14 @@ export interface ActionElement {
   index: number;
   ref?: string;
   text: string;
-  resourceId: string;
-  contentDesc: string;
+  resourceId?: string;
+  contentDesc?: string;
   className: string;
   bounds: string;
-  clickable: boolean;
-  scrollable: boolean;
-  focused: boolean;
-  visible_to_selector_engine: boolean;
+  clickable?: boolean;
+  scrollable?: boolean;
+  focused?: boolean;
+  visible_to_selector_engine?: boolean;
 }
 
 export interface SetupStepReport {

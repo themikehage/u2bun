@@ -42,9 +42,9 @@ function filterElementsMatchingQuery(elements: ActionElement[], query: SelectorQ
     }
     if (query.resourceId && e.resourceId !== query.resourceId) return false;
     if (query.contentDesc && e.contentDesc !== query.contentDesc) return false;
-    if (query.descContains && !e.contentDesc.toLowerCase().includes(query.descContains.toLowerCase())) return false;
+    if (query.descContains && !e.contentDesc?.toLowerCase().includes(query.descContains.toLowerCase())) return false;
     if (query.text && e.text !== query.text) return false;
-    if (query.textContains && !e.text.toLowerCase().includes(query.textContains.toLowerCase())) return false;
+    if (query.textContains && !e.text?.toLowerCase().includes(query.textContains.toLowerCase())) return false;
     if (query.className && e.className !== query.className) return false;
 
     if (query.bounds) {

@@ -21,7 +21,7 @@ describe("Batch Execution (run.steps)", () => {
       debug: false,
       warnings: [],
       warn: () => {},
-      callTool: async () => ({}),
+      callTool: async () => ({} as any),
     };
 
     // We can run tools.list as a read step
@@ -42,7 +42,7 @@ describe("Batch Execution (run.steps)", () => {
       debug: false,
       warnings: [],
       warn: () => {},
-      callTool: async () => ({}),
+      callTool: async () => ({} as any),
     };
 
     const steps = [
@@ -62,7 +62,7 @@ describe("Batch Execution (run.steps)", () => {
       debug: false,
       warnings: [],
       warn: () => {},
-      callTool: async () => ({}),
+      callTool: async () => ({} as any),
     };
 
     expect(executeBatchSteps([], mockCtx)).rejects.toThrow(UsageError);
