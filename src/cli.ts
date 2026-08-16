@@ -324,12 +324,12 @@ export async function runCli(argv: string[]): Promise<number> {
     warnings,
     sessionDir: config.sessionDir,
     warn: (msg: string) => warnings.push(msg),
-    callTool: async (name: string, args: Record<string, unknown>) => {
+    callTool: async <T = Record<string, unknown>>(name: string, args: Record<string, unknown>): Promise<T> => {
       const subTool = registry.getTool(name);
       if (!subTool) throw new InternalError(`Delegated tool '${name}' not found`);
       const validatedInput = subTool.inputSchema.parse(args);
       const res = await subTool.handler(ctx, validatedInput);
-      return subTool.outputSchema.parse(res) as Record<string, unknown>;
+      return subTool.outputSchema.parse(res) as T;
     },
   };
 

@@ -15,7 +15,7 @@ export interface HandlerContext {
 
 export type SafetyClass = "read" | "interactive" | "destructive";
 
-export interface ToolSpec<TInput = Record<string, unknown>, TOutput = Record<string, unknown>> {
+export interface ToolSpec<TInput = any, TOutput = any> {
   name: string;
   domain: string;
   description: string;
@@ -33,7 +33,7 @@ export interface ToolSpec<TInput = Record<string, unknown>, TOutput = Record<str
 export interface DomainSpec {
   name: string;
   description: string;
-  tools: ToolSpec[];
+  tools: ToolSpec<any, any>[];
 }
 
 export class Registry {

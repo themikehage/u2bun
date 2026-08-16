@@ -148,7 +148,7 @@ describe("Session Recording & Statistical Logs", () => {
       warnings: [],
       sessionDir: TEST_SESSION_DIR,
       warn: () => {},
-      callTool: async () => ({}),
+      callTool: async () => ({} as any),
     };
 
     const startRes = (await startTool.handler(ctx, {

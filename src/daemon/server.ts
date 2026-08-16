@@ -187,7 +187,7 @@ export class DaemonServer {
         }
 
         if (url.pathname === "/session/close" && req.method === "POST") {
-          const body = await req.json().catch(() => ({}));
+          const body: any = await req.json().catch(() => ({}));
           const sessionId = body.session_id;
           if (sessionId && self.sseClients.has(sessionId)) {
             const client = self.sseClients.get(sessionId)!;
@@ -286,7 +286,7 @@ export class DaemonServer {
 
         if (url.pathname === "/snapshot" && req.method === "POST") {
           try {
-            const body = await req.json().catch(() => ({}));
+            const body: any = await req.json().catch(() => ({}));
             const includeSystemBars = Boolean(body.include_system_bars);
             const session = await self.getSession();
             const client = session.client!;
@@ -382,7 +382,7 @@ export class DaemonServer {
 
         if (url.pathname === "/state" && (req.method === "POST" || req.method === "GET")) {
           try {
-            const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
+            const body: any = req.method === "POST" ? await req.json().catch(() => ({})) : {};
             const session = await self.getSession();
             const client = session.client!;
 
@@ -441,7 +441,7 @@ export class DaemonServer {
 
         if (url.pathname === "/dump" && req.method === "POST") {
           try {
-            const body = await req.json().catch(() => ({}));
+            const body: any = await req.json().catch(() => ({}));
             const includeSystemBars = Boolean(body.include_system_bars);
             const filterAll = body.filter === "all";
             const session = await self.getSession();
@@ -474,7 +474,7 @@ export class DaemonServer {
 
         if ((url.pathname === "/action" || url.pathname === "/session/action") && req.method === "POST") {
           try {
-            const body = await req.json();
+            const body: any = await req.json();
             const { command, args } = body;
             const session = await self.getSession();
             const client = session.client!;
@@ -899,7 +899,7 @@ export class DaemonServer {
     });
 
     const info: DaemonInfo = {
-      port: this.server.port,
+      port: this.server?.port || this.port || 0,
       pid: process.pid,
       serial: this.serial,
       build_id: BUILD_ID,
