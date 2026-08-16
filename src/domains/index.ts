@@ -6,7 +6,6 @@ import { TOOLS_DOMAIN } from "./tools";
 import { APP_DOMAIN } from "./app";
 import { UI_DOMAIN } from "./ui";
 import { RUN_DOMAIN } from "./run";
-import { SESSION_DOMAIN } from "./session";
 
 export const DOMAINS: DomainSpec[] = [
   DEVICE_DOMAIN,
@@ -16,6 +15,5 @@ export const DOMAINS: DomainSpec[] = [
   APP_DOMAIN,
   UI_DOMAIN,
   RUN_DOMAIN,
-  SESSION_DOMAIN,
 ];
 

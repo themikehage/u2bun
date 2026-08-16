@@ -11,7 +11,6 @@ export interface Config {
   strictSelector: boolean;
   safety: "read" | "interactive" | "destructive";
   adbPath?: string;
-  sessionDir: string;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -21,7 +20,6 @@ export const DEFAULT_CONFIG: Config = {
   json: false,
   strictSelector: false,
   safety: "interactive",
-  sessionDir: "./sessions",
 };
 
 export function loadConfigFile(): Partial<Config> {
@@ -50,7 +48,6 @@ export function loadConfigFile(): Partial<Config> {
       strictSelector: parsed.strictSelector === true,
       safety: parsed.safety,
       adbPath: parsed.adbPath || parsed.ADB_PATH,
-      sessionDir: parsed.sessionDir || parsed.U2CTL_SESSION_DIR,
     };
   } catch {
     return {};
@@ -65,7 +62,6 @@ export function resolveConfig(cliFlags: Partial<Config>): Config {
   const envStrict = process.env.U2CTL_STRICT_SELECTOR === "1" || process.env.U2CTL_STRICT_SELECTOR === "true";
   const envSafety = process.env.U2CTL_SAFETY as Config["safety"] | undefined;
   const envAdb = process.env.ADB_PATH;
-  const envSessionDir = process.env.U2CTL_SESSION_DIR;
 
   return {
     serial: cliFlags.serial ?? envSerial ?? fileConfig.serial,
@@ -76,6 +72,5 @@ export function resolveConfig(cliFlags: Partial<Config>): Config {
     strictSelector: cliFlags.strictSelector ?? (envStrict || fileConfig.strictSelector || DEFAULT_CONFIG.strictSelector),
     safety: cliFlags.safety ?? envSafety ?? fileConfig.safety ?? DEFAULT_CONFIG.safety,
     adbPath: cliFlags.adbPath ?? envAdb ?? fileConfig.adbPath,
-    sessionDir: cliFlags.sessionDir ?? envSessionDir ?? fileConfig.sessionDir ?? DEFAULT_CONFIG.sessionDir,
   };
 }

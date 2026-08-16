@@ -129,9 +129,6 @@ Run everything as `bun run src/index.ts [--serial <SERIAL>] <domain> <command> [
 | `tools show` | Spec for one tool/domain. | `--name` |
 | `tools schema` | Machine-readable schema. | `--format openai\|raw` |
 | `run steps` | Batch sequence in one process. | `--steps '<JSON array>'` or `--file <path>` |
-| `session start` | Start recording session for statistical JSON logs. | `--name "<task>"`, `--output-dir` |
-| `session end` | End active recording session and write finalized JSON log. | `--output-dir` |
-| `session status` | Check if a recording session is currently active. | `--output-dir` |
 
 `run steps` composes any sequence, e.g. `run steps --steps '[{"tool":"ui.scroll","args":{"direction":"down"}},{"tool":"ui.snapshot","args":{}}]'`.
 
