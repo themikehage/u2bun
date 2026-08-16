@@ -125,4 +125,45 @@ export class U2Client {
   async openQuickSettings(): Promise<boolean> {
     return this.call<boolean>("openQuickSettings", []);
   }
+
+  async getClipboard(): Promise<string> {
+    return this.call<string>("getClipboard", []);
+  }
+
+  async setClipboardText(text: string): Promise<boolean> {
+    return this.call<boolean>("setClipboard", [null, text]);
+  }
+
+  async drag(startX: number, startY: number, endX: number, endY: number, steps: number = 40): Promise<boolean> {
+    return this.call<boolean>("drag", [
+      Math.round(startX),
+      Math.round(startY),
+      Math.round(endX),
+      Math.round(endY),
+      steps,
+    ]);
+  }
+
+  async pinchIn(bounds: { x1: number; y1: number; x2: number; y2: number }, percent: number = 50, steps: number = 30): Promise<boolean> {
+    return this.call<boolean>("pinchIn", [
+      Math.round(bounds.x1),
+      Math.round(bounds.y1),
+      Math.round(bounds.x2),
+      Math.round(bounds.y2),
+      steps,
+      percent,
+    ]);
+  }
+
+  async pinchOut(bounds: { x1: number; y1: number; x2: number; y2: number }, percent: number = 50, steps: number = 30): Promise<boolean> {
+    return this.call<boolean>("pinchOut", [
+      Math.round(bounds.x1),
+      Math.round(bounds.y1),
+      Math.round(bounds.x2),
+      Math.round(bounds.y2),
+      steps,
+      percent,
+    ]);
+  }
 }
+

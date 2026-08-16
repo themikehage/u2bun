@@ -106,6 +106,36 @@ export function renderOutput(
       return;
     }
 
+    if (envelope.command === "ui.screenshot" && typeof res.path === "string") {
+      console.log(res.path);
+      return;
+    }
+
+    if (envelope.command === "device.clipboard") {
+      if (res.action === "get") {
+        console.log(res.text ?? "");
+        return;
+      }
+      console.log("ok");
+      return;
+    }
+
+    if (envelope.command === "ui.notifications") {
+      if (res.action === "read" && Array.isArray(res.notifications)) {
+        if (res.notifications.length === 0) {
+          console.log("none");
+        } else {
+          const lines = res.notifications.map((n: any) =>
+            n.title && n.text ? `[${n.package}] ${n.title}: ${n.text}` : `[${n.package}] ${n.title || n.text}`
+          );
+          console.log(lines.join("\n"));
+        }
+        return;
+      }
+      console.log("ok");
+      return;
+    }
+
     // 2. Query commands: app.current, app.list, device.list, device.status/auto, daemon.status
     if (typeof res.running === "boolean") {
       if (res.running) {
@@ -133,6 +163,11 @@ export function renderOutput(
       return;
     }
 
+    if (typeof res.on === "boolean" && envelope.command === "device.screen") {
+      console.log(res.on ? "on" : "off");
+      return;
+    }
+
     // 3. Action commands: check by command name or action flags
     const ACTION_COMMANDS = new Set([
       "ui.tap",
@@ -142,8 +177,17 @@ export function renderOutput(
       "ui.swipe",
       "ui.scroll",
       "ui.long_press",
+      "ui.keyboard_hide",
+      "ui.drag",
+      "ui.pinch",
       "app.start",
       "app.stop",
+      "app.restart",
+      "app.clear",
+      "app.open_url",
+      "app.grant_permissions",
+      "device.wake",
+      "device.unlock",
       "device.reconnect",
       "daemon.stop",
       "daemon.restart",
@@ -158,6 +202,14 @@ export function renderOutput(
       res.started ||
       res.stopped ||
       res.restarted ||
+      res.cleared ||
+      res.opened ||
+      res.granted ||
+      res.dragged ||
+      res.pinched ||
+      res.woken ||
+      res.unlocked ||
+      res.hidden ||
       res.satisfied ||
       res.duration !== undefined ||
       Object.keys(res).length === 0

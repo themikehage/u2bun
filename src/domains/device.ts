@@ -122,6 +122,109 @@ export const DEVICE_DOMAIN: DomainSpec = {
       },
     },
     {
+      name: "device.wake",
+      domain: "device",
+      description: "Wake up device screen using KEYEVENT_WAKEUP",
+      inputSchema: z.object({}),
+      outputSchema: z.object({
+        woken: z.boolean(),
+      }),
+      safety: "interactive",
+      expect: {
+        schema: z.object({ woken: z.literal(true) }),
+      },
+      handler: async (ctx) => {
+        const { target } = await selectTargetDevice(ctx.serial);
+        ctx.serial = target.serial;
+        await execAdb(["-s", target.serial, "shell", "input", "keyevent", "224"]);
+        return { woken: true };
+      },
+    },
+    {
+      name: "device.unlock",
+      domain: "device",
+      description: "Wake screen and dismiss standard swipe lockscreen",
+      inputSchema: z.object({}),
+      outputSchema: z.object({
+        unlocked: z.boolean(),
+      }),
+      safety: "interactive",
+      expect: {
+        schema: z.object({ unlocked: z.literal(true) }),
+      },
+      handler: async (ctx) => {
+        const { target } = await selectTargetDevice(ctx.serial);
+        ctx.serial = target.serial;
+
+        // Wake screen first
+        await execAdb(["-s", target.serial, "shell", "input", "keyevent", "224"]);
+        
+        // Small delay then swipe up to unlock
+        await new Promise((r) => setTimeout(r, 200));
+
+        // Get display dimensions or use sensible defaults
+        let width = 1080;
+        let height = 2340;
+        try {
+          const { stdout } = await execAdb(["-s", target.serial, "shell", "wm", "size"]);
+          const match = stdout.match(/Physical size:\s*(\d+)x(\d+)/);
+          if (match) {
+            width = parseInt(match[1], 10);
+            height = parseInt(match[2], 10);
+          }
+        } catch {}
+
+        const startX = Math.round(width / 2);
+        const startY = Math.round(height * 0.85);
+        const endY = Math.round(height * 0.15);
+
+        // Perform swipe up + menu key to dismiss lockscreen
+        await execAdb(["-s", target.serial, "shell", "input", "swipe", String(startX), String(startY), String(startX), String(endY), "150"]);
+        await execAdb(["-s", target.serial, "shell", "input", "keyevent", "82"]);
+
+        return { unlocked: true };
+      },
+    },
+    {
+      name: "device.screen",
+      domain: "device",
+      description: "Quickly check if device screen is on or off",
+      inputSchema: z.object({}),
+      outputSchema: z.object({
+        on: z.boolean(),
+      }),
+      safety: "read",
+      handler: async (ctx) => {
+        const { target } = await selectTargetDevice(ctx.serial);
+        ctx.serial = target.serial;
+
+        let screenOn = true;
+        try {
+          const { stdout } = await execAdb(["-s", target.serial, "shell", "dumpsys", "power"]);
+          for (const line of stdout.split("\n")) {
+            if (line.includes("mHoldingDisplaySuspendBlocker") || line.includes("Display Power: state=")) {
+              if (line.includes("false") || line.includes("state=OFF")) {
+                screenOn = false;
+                break;
+              }
+              if (line.includes("true") || line.includes("state=ON")) {
+                screenOn = true;
+                break;
+              }
+            }
+          }
+        } catch {
+          // Fallback to session
+          const session = new DeviceSession(ctx.serial, ctx.timeout);
+          const client = await session.connect();
+          const info = await client.deviceInfo();
+          screenOn = info.screenOn ?? true;
+        }
+
+        return { on: screenOn };
+      },
+    },
+    {
       name: "device.reconnect",
       domain: "device",
       description: "Perform soft reconnect or hard adb server restart to recover device connection",
@@ -140,6 +243,67 @@ export const DEVICE_DOMAIN: DomainSpec = {
         ctx.serial = target.serial;
         const msg = await reconnectDevice(target.serial, args.hard);
         return { message: msg };
+      },
+    },
+    {
+      name: "device.clipboard",
+      domain: "device",
+      description: "Read or write Android system clipboard text",
+      inputSchema: z.object({
+        action: z.enum(["get", "set"]).optional().default("get").describe("Operation: 'get' to read, 'set' to write"),
+        text: z.string().optional().describe("Text content to write when action is 'set'"),
+      }),
+      outputSchema: z.object({
+        action: z.string(),
+        text: z.string().optional(),
+        success: z.boolean(),
+      }),
+      safety: "interactive",
+      expect: {
+        schema: z.object({ success: z.literal(true) }),
+      },
+      handler: async (ctx, args) => {
+        const { target } = await selectTargetDevice(ctx.serial);
+        ctx.serial = target.serial;
+
+        if (args.action === "set") {
+          if (args.text === undefined) {
+            throw new UsageError("Flag '--text' is required when action is 'set'");
+          }
+          let setOk = false;
+          try {
+            const session = new DeviceSession(ctx.serial, ctx.timeout);
+            const client = await session.connect();
+            setOk = await client.setClipboardText(args.text);
+          } catch {}
+
+          if (!setOk) {
+            await execAdb(["-s", target.serial, "shell", "cmd", "clipboard", "set", "text", args.text]);
+          }
+
+          return { action: "set", text: args.text, success: true };
+        } else {
+          // action === "get"
+          let clipText = "";
+          let gotClip = false;
+          try {
+            const session = new DeviceSession(ctx.serial, ctx.timeout);
+            const client = await session.connect();
+            clipText = await client.getClipboard();
+            gotClip = true;
+          } catch {}
+
+          if (!gotClip) {
+            try {
+              const res = await execAdb(["-s", target.serial, "shell", "cmd", "clipboard", "get"]);
+              if (res.exitCode === 0) {
+                clipText = res.stdout.trim();
+              }
+            } catch {}
+          }
+
+          return { action: "get", text: clipText || "", success: true };
+        }
       },
     },
   ],
